@@ -17,6 +17,7 @@ Connection:
   Database name is fixed: "premium_bot".
 """
 
+import asyncio
 import logging
 import os
 from datetime import datetime, timezone, timedelta
@@ -805,9 +806,14 @@ async def move_plan_to_bottom(plan_id: int) -> bool:
 async def get_start_demo() -> dict:
     """Return start demo config: {enabled: bool, ids: list[int], source: str}."""
     import json
-    enabled = (await get_setting("start_demo_enabled")) == "1"
-    raw_ids = (await get_setting("start_demo_ids")) or "[]"
-    source  = (await get_setting("start_demo_source")) or ""
+    enabled_value, raw_ids, source = await asyncio.gather(
+        get_setting("start_demo_enabled"),
+        get_setting("start_demo_ids"),
+        get_setting("start_demo_source"),
+    )
+    enabled = enabled_value == "1"
+    raw_ids = raw_ids or "[]"
+    source = source or ""
     try:
         ids = [int(x) for x in json.loads(raw_ids)]
     except Exception:
