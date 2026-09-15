@@ -267,11 +267,12 @@ async def cmd_start(message: Message, bot: Bot) -> None:
             "new-user logging and reminder",
         )
 
-    # Send start demo videos (if enabled by admin) — always, regardless of plans
-    _schedule_background(
-        send_start_demo_videos(bot, message.chat.id, user.id),
-        "start demo video sending",
-    )
+    # Send start demo videos (if enabled by admin) — always, regardless of plans.
+    # This must complete before either user-facing start message is sent.
+    try:
+        await send_start_demo_videos(bot, message.chat.id, user.id)
+    except Exception:
+        logger.exception("Start demo delivery failed for user %s; continuing to /start UI", user.id)
 
     step_started = time.perf_counter()
     plans, welcome_setting, has_approved, first_setting, max_setting = await asyncio.gather(
@@ -374,16 +375,20 @@ async def callback_plan(call: CallbackQuery, bot: Bot) -> None:
         ),
         "plan selection logging",
     )
-    _schedule_background(
-        _send_plan_demo_and_activate(
+    try:
+        await _send_plan_demo_and_activate(
             bot,
             call.message.chat.id,
             call.from_user.id,
             plan,
             flow_started,
-        ),
-        "plan demo video sending",
-    )
+        )
+    except Exception:
+        logger.exception(
+            "Plan demo delivery failed for user %s plan %s; continuing to buy message",
+            call.from_user.id,
+            plan_id,
+        )
     step_started = time.perf_counter()
     await call.message.answer(
         _render_plan_text(plan),
