@@ -23,6 +23,8 @@ class VcGatewayTests(unittest.TestCase):
         query = parse_qs(urlsplit(uri).query)
         self.assertEqual(query["pa"], ["merchant@example"])
         self.assertEqual(query["am"], ["129.5"])
+        self.assertEqual(query["tid"], [provider_order_id])
+        self.assertEqual(query["tr"], [provider_order_id])
         self.assertEqual(query["tn"], [provider_order_id])
         self.assertTrue(payment._generate_vc_qr_bytes("129.50", provider_order_id))
 
@@ -30,7 +32,8 @@ class VcGatewayTests(unittest.TestCase):
         order_id = payment._make_vc_order_id()
         self.assertRegex(order_id, r"^ORD\d{6}[A-Z0-9]{6}$")
         self.assertTrue(payment._is_valid_vc_order_id(order_id))
-        self.assertFalse(payment._is_valid_vc_order_id("VC2609171412446FEE8B01"))
+        self.assertTrue(payment._is_valid_vc_order_id("ORDER123"))
+        self.assertTrue(payment._is_valid_vc_order_id("VC2609171412446FEE8B01"))
 
     def test_response_parser_handles_json_and_plain_statuses(self):
         parsed = payment._parse_vc_gateway_response(
@@ -196,20 +199,42 @@ class VcGatewayTests(unittest.TestCase):
         self.assertEqual(summary["status"], "FAILED")
         self.assertEqual(summary["gateway_message"], "Invalid Order Id.")
 
-    def test_legacy_vc_prefixed_order_id_is_rejected_before_api_call(self):
+    def test_provider_order_id_is_not_restricted_to_local_format(self):
         order = {
             "order_id": "ORD-INTERNAL",
             "vc_order_id": "VC2609171412446FEE8B01",
             "expected_amount": "1",
         }
+        class FakeResponse:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def text(self):
+                return '{"status":"PENDING"}'
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def get(self, *_args, **_kwargs):
+                return FakeResponse()
+
         with (
             patch.object(payment, "VC_GATEWAY_API_KEY", "secret"),
-            patch.object(payment.aiohttp, "ClientSession") as client_session,
+            patch.object(payment.aiohttp, "ClientSession", return_value=FakeSession()),
         ):
             result = asyncio.run(payment.verify_vc_gateway_payment(order))
 
-        self.assertEqual(result, ("ERROR", None))
-        client_session.assert_not_called()
+        self.assertEqual(result[0], "PENDING")
 
     def test_invalid_order_id_does_not_activate_vc_order(self):
         order = {
@@ -458,6 +483,7 @@ class VcGatewayTests(unittest.TestCase):
 
         (result, _summary), info = asyncio.run(verify())
         self.assertEqual(result, "PENDING")
+        self.assertEqual(session.url, payment.VC_GATEWAY_API_URL)
         self.assertEqual(session.params["api_key"], "secret")
         self.assertEqual(session.params["order_id"], order["vc_order_id"])
         self.assertEqual(session.params["amount"], "39")

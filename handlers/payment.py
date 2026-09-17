@@ -95,7 +95,6 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 _IST = timezone(timedelta(hours=5, minutes=30))
-_VC_ORDER_ID_PATTERN = re.compile(r"^ORD\d{6}[A-Z0-9]{6}$")
 
 # user_id -> { order_id, plan_name, plan_price, plan_validity, access_link, final_price }
 _awaiting_proof: dict[int, dict] = {}
@@ -237,7 +236,7 @@ def _make_vc_order_id() -> str:
 
 
 def _is_valid_vc_order_id(order_id: str | None) -> bool:
-    return bool(_VC_ORDER_ID_PATTERN.fullmatch(str(order_id or "")))
+    return bool(str(order_id or "").strip())
 
 
 def _build_vc_upi_uri(amount: str | Decimal, vc_order_id: str) -> str:
@@ -246,6 +245,8 @@ def _build_vc_upi_uri(amount: str | Decimal, vc_order_id: str) -> str:
         "pn": "Payee",
         "am": _format_amount(amount),
         "cu": "INR",
+        "tid": vc_order_id,
+        "tr": vc_order_id,
         "tn": vc_order_id,
     }
     return "upi://pay?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
@@ -1836,7 +1837,7 @@ async def callback_vc_check(call: CallbackQuery, bot: Bot) -> None:
                 await _edit_or_create_status_message(call, bot, user.id, order_id, info, "✅ <b>Your plan is already activated.</b>\n\nUse /status to check your subscription.", main_menu_keyboard())
             return
         messages = {
-            "PENDING": "⏳ Payment not detected yet. Please wait a moment and try again.\n\n💡 If you have already paid, please contact support.",
+            "PENDING": "Payment not detected yet. Please wait a moment and try again.\n\nIf you have already paid, please contact support.",
             "FAILED": "❌ VC Gateway reports that this payment failed. Please generate a new QR and try again.",
             "INVALID": "⚠️ VC Gateway returned an invalid payment response. Please contact support if you have already paid.",
             "NOT_FOUND": "⚠️ VC Gateway could not find this payment yet. Please wait a moment and try again.",
