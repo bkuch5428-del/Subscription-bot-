@@ -165,3 +165,16 @@ async def log_payment_cancelled(
         f"🆔 Order: <code>{html.escape(order_id)}</code>\n\n"
         f"{_contact_line(user_id, username)}",
     )
+
+
+async def log_maintenance_changed(bot: Bot, admin_user_id: int, enabled: bool) -> None:
+    """Record maintenance changes in the existing activity log channel."""
+    action = "enabled" if enabled else "disabled"
+    await _send(
+        bot,
+        "🔧 <b>Maintenance Mode Updated</b>\n\n"
+        f"👤 Admin ID: <code>{admin_user_id}</code>\n"
+        f"📝 Action: {action}\n"
+        f"🕒 Time: {_now_ist()}\n"
+        f"📌 New status: {'ON' if enabled else 'OFF'}",
+    )

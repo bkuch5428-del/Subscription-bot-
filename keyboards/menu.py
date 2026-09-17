@@ -66,6 +66,22 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="⚙️ Settings", callback_data="admin_settings"),
             ],
+            [
+                InlineKeyboardButton(text="🔧 Maintenance Mode", callback_data="admin_maintenance"),
+            ],
+        ]
+    )
+
+
+def maintenance_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    action = "Disable Maintenance" if enabled else "Enable Maintenance"
+    callback = "maintenance_disable" if enabled else "maintenance_enable"
+    status = "🔴 Maintenance ON" if enabled else "🟢 Maintenance OFF"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=status, callback_data="maintenance_status")],
+            [InlineKeyboardButton(text=action, callback_data=callback)],
+            [InlineKeyboardButton(text="⬅️ Back", callback_data="maintenance_back")],
         ]
     )
 

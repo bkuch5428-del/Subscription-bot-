@@ -179,6 +179,7 @@ async def init_db() -> None:
         ("payment_mode",             "automatic"),  # "automatic" or "manual"
         ("manual_payment_qr",        ""),    # QR image URL for manual payment mode
         ("manual_upi_text",          ""),    # UPI ID / text shown in manual payment mode
+        ("maintenance_mode",         False), # normal-user access gate
     ]
     for key, value in _defaults:
         await _settings.update_one(
@@ -1208,6 +1209,17 @@ async def set_setting(key: str, value: str) -> None:
         upsert=True,
     )
     logger.info("Setting %r updated", key)
+
+
+async def set_maintenance_mode(enabled: bool) -> bool:
+    """Atomically set the maintenance flag and return the stored state."""
+    await _settings.update_one(
+        {"_id": "maintenance_mode"},
+        {"$set": {"value": enabled}},
+        upsert=True,
+    )
+    logger.info("Maintenance mode updated enabled=%s", enabled)
+    return enabled
 
 
 async def get_all_settings() -> dict[str, str]:

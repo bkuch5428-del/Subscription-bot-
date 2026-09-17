@@ -24,9 +24,10 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 
-from config import ADMIN_IDS, SOURCE_CHANNEL_ID
+from config import SOURCE_CHANNEL_ID
 import handlers.settings as _settings_module  # for cross-module state clearing
-from handlers.log_channel import get_user_contact_link
+from handlers.log_channel import get_user_contact_link, log_maintenance_changed
+from handlers.maintenance import is_admin_user, is_maintenance_mode
 from database import (
     create_plan,
     get_all_plans,
@@ -67,6 +68,7 @@ from keyboards.menu import (
     payment_settings_keyboard,
     admin_users_keyboard,
     admin_user_details_keyboard,
+    maintenance_keyboard,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,7 +101,7 @@ EDIT_FIELD_LABELS = {
 # ── Guards ────────────────────────────────────────────────────────────────────
 
 def _is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    return is_admin_user(user_id)
 
 
 def _user_contact_link(user: dict) -> str:
@@ -217,6 +219,73 @@ async def cb_stats(call: CallbackQuery) -> None:
         "━━━━━━━━━━━━━━━━━━━━━",
         reply_markup=admin_panel_keyboard(),
     )
+
+
+async def _show_maintenance_panel(call: CallbackQuery) -> None:
+    enabled = await is_maintenance_mode()
+    text = (
+        "🔧 <b>Maintenance Mode</b>\n\n"
+        f"Status: {'🔴 Maintenance ON' if enabled else '🟢 Maintenance OFF'}\n\n"
+        "Normal users are blocked while maintenance is enabled."
+    )
+    try:
+        await call.message.edit_text(text, reply_markup=maintenance_keyboard(enabled))
+    except Exception:
+        await call.message.answer(text, reply_markup=maintenance_keyboard(enabled))
+
+
+@router.callback_query(lambda c: c.data == "admin_maintenance")
+async def cb_maintenance_panel(call: CallbackQuery) -> None:
+    if not _is_admin(call.from_user.id):
+        await call.answer("⛔ Unauthorised.", show_alert=True)
+        return
+    await call.answer()
+    await _show_maintenance_panel(call)
+
+
+@router.callback_query(lambda c: c.data == "maintenance_status")
+async def cb_maintenance_status(call: CallbackQuery) -> None:
+    if not _is_admin(call.from_user.id):
+        await call.answer("⛔ Unauthorised.", show_alert=True)
+        return
+    await call.answer()
+    await _show_maintenance_panel(call)
+
+
+async def _set_maintenance(call: CallbackQuery, enabled: bool, bot: Bot) -> None:
+    if not _is_admin(call.from_user.id):
+        await call.answer("⛔ Unauthorised.", show_alert=True)
+        return
+    from database import set_maintenance_mode
+
+    try:
+        await set_maintenance_mode(enabled)
+        await log_maintenance_changed(bot, call.from_user.id, enabled)
+    except Exception:
+        logger.exception("Failed to update maintenance mode admin_id=%s", call.from_user.id)
+        await call.answer("⚠️ Could not update maintenance mode.", show_alert=True)
+        return
+    await call.answer("Maintenance mode updated.")
+    await _show_maintenance_panel(call)
+
+
+@router.callback_query(lambda c: c.data == "maintenance_enable")
+async def cb_maintenance_enable(call: CallbackQuery, bot: Bot) -> None:
+    await _set_maintenance(call, True, bot)
+
+
+@router.callback_query(lambda c: c.data == "maintenance_disable")
+async def cb_maintenance_disable(call: CallbackQuery, bot: Bot) -> None:
+    await _set_maintenance(call, False, bot)
+
+
+@router.callback_query(lambda c: c.data == "maintenance_back")
+async def cb_maintenance_back(call: CallbackQuery) -> None:
+    if not _is_admin(call.from_user.id):
+        await call.answer("⛔ Unauthorised.", show_alert=True)
+        return
+    await call.answer()
+    await _go_panel(call)
 
 
 @router.callback_query(lambda c: c.data == "admin_users")

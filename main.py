@@ -16,6 +16,7 @@ from handlers import start
 from handlers import payment
 from handlers import admin
 from handlers import settings as settings_handler
+from handlers.maintenance import MaintenanceMiddleware
 import reminder_scheduler
 
 logging.basicConfig(level=logging.INFO)
@@ -59,6 +60,8 @@ async def main() -> None:
     await bot.delete_webhook(drop_pending_updates=True)
 
     dp = Dispatcher()
+    dp.message.outer_middleware(MaintenanceMiddleware())
+    dp.callback_query.outer_middleware(MaintenanceMiddleware())
 
     # Registration order matters for filter priority:
     # admin first (catches /admin and all admin_ callbacks),
