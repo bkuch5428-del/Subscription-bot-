@@ -2049,13 +2049,16 @@ async def handle_link_value(message: Message) -> None:
 
 async def _payment_settings_panel(target) -> None:
     """Show (or re-show) the Payment Settings sub-panel."""
-    mode = (await get_setting("payment_mode", "automatic")) or "automatic"
-    mode_label = "🟢 Automatic" if mode == "automatic" else "🟠 Manual"
+    active_provider = (await get_setting("active_payment_provider", "famapp") or "famapp").strip().lower()
+    provider_labels = {"famapp": "FamApp", "manual": "Manual Payment", "vc_gateway": "VC Gateway"}
+    if active_provider not in provider_labels:
+        logger.warning("Invalid active_payment_provider=%r in payment panel; using FamApp", active_provider)
+        active_provider = "famapp"
     qr_val  = (await get_setting("manual_payment_qr",  "")) or ""
     upi_val = (await get_setting("manual_upi_text",    "")) or ""
     text = (
         "💳 <b>Payment Settings</b>\n\n"
-        f"Active mode: <b>{mode_label}</b>\n"
+        f"Active Payment Provider: <b>{provider_labels[active_provider]}</b>\n"
         f"Manual QR: {'✅ set' if qr_val else '⬜ not set'}\n"
         f"Manual UPI text: {'✅ set' if upi_val else '⬜ not set'}\n\n"
         "Select an option:"
@@ -2071,20 +2074,17 @@ async def _payment_settings_panel(target) -> None:
 
 
 async def _payment_provider_settings_panel(target) -> None:
-    states = {
-        "famapp": (await get_setting("famapp_enabled", "1")) == "1",
-        "manual": (await get_setting("manual_payment_enabled", "1")) == "1",
-        "vc_gateway": (await get_setting("vc_gateway_enabled", "0")) == "1",
-    }
+    active_provider = (await get_setting("active_payment_provider", "famapp") or "famapp").strip().lower()
+    if active_provider not in {"famapp", "manual", "vc_gateway"}:
+        logger.warning("Invalid active_payment_provider=%r in admin panel; using FamApp", active_provider)
+        active_provider = "famapp"
+    labels = {"famapp": "FamApp", "manual": "Manual Payment", "vc_gateway": "VC Gateway"}
     text = (
-        "⚙️ <b>Payment Provider Settings</b>\n\n"
-        "FamApp and Manual Payment are enabled by default.\n"
-        f"FamApp: {'ON' if states['famapp'] else 'OFF'}\n"
-        f"Manual Payment: {'ON' if states['manual'] else 'OFF'}\n"
-        f"VC Gateway: {'ON' if states['vc_gateway'] else 'OFF'}\n\n"
-        "Select a provider to toggle it."
+        "⚙️ <b>Active Payment Provider</b>\n\n"
+        f"Current provider: <b>{labels[active_provider]}</b>\n\n"
+        "Select the provider to use for new Buy Now clicks."
     )
-    kb = payment_provider_settings_keyboard(states)
+    kb = payment_provider_settings_keyboard(active_provider)
     if isinstance(target, CallbackQuery):
         try:
             await target.message.edit_text(text, reply_markup=kb)
@@ -2118,15 +2118,14 @@ async def cb_toggle_payment_provider(call: CallbackQuery) -> None:
     if not _is_admin(call.from_user.id):
         await call.answer("⛔ Unauthorised.", show_alert=True)
         return
-    key_by_callback = {
-        "admin_pp_famapp": "famapp_enabled",
-        "admin_pp_manual": "manual_payment_enabled",
-        "admin_pp_vc_gateway": "vc_gateway_enabled",
+    provider_by_callback = {
+        "admin_pp_famapp": "famapp",
+        "admin_pp_manual": "manual",
+        "admin_pp_vc_gateway": "vc_gateway",
     }
-    key = key_by_callback[call.data]
-    current = (await get_setting(key, "0")) == "1"
-    await set_setting(key, "0" if current else "1")
-    await call.answer(f"{'Disabled' if current else 'Enabled'}.", show_alert=True)
+    provider = provider_by_callback[call.data]
+    await set_setting("active_payment_provider", provider)
+    await call.answer(f"Active provider: {provider}.", show_alert=True)
     await _payment_provider_settings_panel(call)
 
 

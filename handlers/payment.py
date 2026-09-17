@@ -191,6 +191,14 @@ async def _enabled_payment_providers() -> list[str]:
     return enabled
 
 
+async def _active_payment_provider() -> str | None:
+    provider = str(await get_setting("active_payment_provider", "famapp") or "famapp").strip().lower()
+    if provider in {"famapp", "manual", "vc_gateway"}:
+        return provider
+    logger.warning("Invalid active_payment_provider=%r; falling back to FamApp", provider)
+    return "famapp"
+
+
 def _order_provider(order: dict) -> str:
     provider = order.get("payment_provider")
     if provider:
@@ -1421,14 +1429,7 @@ async def callback_choose_payment(call: CallbackQuery, bot: Bot) -> None:
     except (AttributeError, ValueError, IndexError):
         await call.message.answer("⚠️ Invalid plan. Please try again.")
         return
-    providers = await _enabled_payment_providers()
-    if not providers:
-        await call.message.edit_text("Currently no payment method is available.\nPlease contact support.")
-        return
-    if len(providers) == 1:
-        await callback_buy(call, bot, plan_id=plan_id, provider=providers[0])
-        return
-    await call.message.edit_text("💳 <b>Select a payment method</b>", reply_markup=payment_provider_keyboard(plan_id, providers))
+    await callback_buy(call, bot, plan_id=plan_id)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("payment_method:"))
@@ -1439,10 +1440,7 @@ async def callback_payment_method(call: CallbackQuery, bot: Bot) -> None:
     except (AttributeError, ValueError, IndexError):
         await call.answer("⚠️ Invalid payment method.", show_alert=True)
         return
-    if provider not in {"famapp", "manual", "vc_gateway"} or provider not in await _enabled_payment_providers():
-        await call.answer("⚠️ This payment method is currently unavailable.", show_alert=True)
-        return
-    await callback_buy(call, bot, plan_id=plan_id, provider=provider)
+    await callback_buy(call, bot, plan_id=plan_id)
 
 
 # ── Buy Now (buy:{plan_id}) ───────────────────────────────────────────────────
@@ -1587,13 +1585,8 @@ async def callback_buy(
             f"💳 <b>Final Price:</b> ₹{final_price_str}"
         )
 
-        # Direct legacy buy callbacks continue to use the old setting; the
-        # normal plan screen supplies an explicit provider choice.
-        selected_provider = provider
+        selected_provider = provider or await _active_payment_provider()
         if selected_provider is None:
-            payment_mode = (await get_setting("payment_mode", "automatic")) or "automatic"
-            selected_provider = "manual" if payment_mode == "manual" else "famapp"
-        if selected_provider not in await _enabled_payment_providers():
             await call.message.answer("Currently no payment method is available.\nPlease contact support.")
             return
 

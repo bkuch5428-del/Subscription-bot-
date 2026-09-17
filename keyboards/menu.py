@@ -290,7 +290,7 @@ def plan_interest_reminder_keyboard(plan_id: int) -> InlineKeyboardMarkup:
     """
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Buy Now",        callback_data=f"choose_payment:{plan_id}")],
+            [InlineKeyboardButton(text="💳 Buy Now",        callback_data=f"buy:{plan_id}")],
             [InlineKeyboardButton(text="🏷️ Get Discount",   callback_data="open_refer")],
         ]
     )
@@ -300,7 +300,7 @@ def plan_detail_keyboard(plan_id: int) -> InlineKeyboardMarkup:
     """Plan detail screen — Buy Now + Back."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Buy Now",   callback_data=f"choose_payment:{plan_id}")],
+            [InlineKeyboardButton(text="💳 Buy Now",   callback_data=f"buy:{plan_id}")],
             [InlineKeyboardButton(text="⬅️ Back",       callback_data="back")],
         ]
     )
@@ -392,13 +392,9 @@ def referral_settings_keyboard(enabled: bool) -> InlineKeyboardMarkup:
 
 
 def payment_settings_keyboard(mode: str) -> InlineKeyboardMarkup:
-    """Sub-panel for Payment Settings. Marks the active mode with ✅."""
-    auto_mark   = "✅ " if mode == "automatic" else ""
-    manual_mark = "✅ " if mode == "manual"    else ""
+    """Sub-panel for payment configuration and active provider selection."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=f"{auto_mark}🟢 Automatic Payment",      callback_data="admin_pm_automatic")],
-            [InlineKeyboardButton(text=f"{manual_mark}🟠 Manual Payment",        callback_data="admin_pm_manual")],
             [InlineKeyboardButton(text="🖼 Change Manual Payment QR",            callback_data="admin_pm_qr")],
             [InlineKeyboardButton(text="📝 Change Manual UPI Text",              callback_data="admin_pm_upi")],
             [InlineKeyboardButton(text="⚙️ Payment Provider Settings",           callback_data="admin_payment_provider_settings")],
@@ -407,16 +403,18 @@ def payment_settings_keyboard(mode: str) -> InlineKeyboardMarkup:
     )
 
 
-def payment_provider_settings_keyboard(states: dict[str, bool]) -> InlineKeyboardMarkup:
-    def status(provider: str, label: str) -> str:
-        enabled = states.get(provider, False)
-        return f"{'✅' if enabled else '🚫'} {label}: {'ON' if enabled else 'OFF'}"
+def payment_provider_settings_keyboard(active_provider: str) -> InlineKeyboardMarkup:
+    labels = {
+        "famapp": "FamApp",
+        "manual": "Manual Payment",
+        "vc_gateway": "VC Gateway",
+    }
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=status("famapp", "FamApp"), callback_data="admin_pp_famapp")],
-            [InlineKeyboardButton(text=status("manual", "Manual Payment"), callback_data="admin_pp_manual")],
-            [InlineKeyboardButton(text=status("vc_gateway", "VC Gateway"), callback_data="admin_pp_vc_gateway")],
+            [InlineKeyboardButton(text=f"{'✅ ' if active_provider == 'famapp' else ''}{labels['famapp']}", callback_data="admin_pp_famapp")],
+            [InlineKeyboardButton(text=f"{'✅ ' if active_provider == 'manual' else ''}{labels['manual']}", callback_data="admin_pp_manual")],
+            [InlineKeyboardButton(text=f"{'✅ ' if active_provider == 'vc_gateway' else ''}{labels['vc_gateway']}", callback_data="admin_pp_vc_gateway")],
             [InlineKeyboardButton(text="⬅️ Back", callback_data="admin_payment_settings")],
         ]
     )

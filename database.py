@@ -180,6 +180,7 @@ async def init_db() -> None:
         ("max_referral_discount",    "100"), # maximum total discount a user can earn
         ("max_referrals",            "0"),   # max referrals per referrer (0 = unlimited)
         ("payment_mode",             "automatic"),  # "automatic" or "manual"
+        ("active_payment_provider",  "famapp"),
         ("famapp_enabled",           "1"),
         ("manual_payment_enabled",    "1"),
         ("vc_gateway_enabled",        "1" if VC_GATEWAY_ENABLED else "0"),

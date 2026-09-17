@@ -95,6 +95,28 @@ class VcGatewayTests(unittest.TestCase):
             providers = asyncio.run(payment._enabled_payment_providers())
         self.assertEqual(providers, ["famapp", "manual"])
 
+    def test_active_provider_defaults_to_famapp(self):
+        async def setting(_key, default=""):
+            return default
+
+        with patch.object(payment, "get_setting", new=setting):
+            self.assertEqual(asyncio.run(payment._active_payment_provider()), "famapp")
+
+    def test_invalid_active_provider_falls_back_to_famapp(self):
+        with patch.object(payment, "get_setting", new=AsyncMock(return_value="unknown")):
+            self.assertEqual(asyncio.run(payment._active_payment_provider()), "famapp")
+
+    def test_legacy_provider_selection_callback_routes_directly(self):
+        call = SimpleNamespace(
+            data="choose_payment:3",
+            message=SimpleNamespace(),
+            answer=AsyncMock(),
+        )
+        bot = AsyncMock()
+        with patch.object(payment, "callback_buy", new=AsyncMock()) as callback_buy:
+            asyncio.run(payment.callback_choose_payment(call, bot))
+        callback_buy.assert_awaited_once_with(call, bot, plan_id=3)
+
     def test_all_disabled_has_no_enabled_provider(self):
         async def setting(_key, _default=""):
             return "0"
