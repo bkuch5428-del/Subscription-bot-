@@ -9,7 +9,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import BotCommand
 
-from config import BOT_TOKEN
+from config import BOT_TOKEN, validate_vc_gateway_config
 from database import init_db
 from handlers import commands
 from handlers import start
@@ -23,6 +23,7 @@ logging.basicConfig(level=logging.INFO)
 
 _startup_logger = logging.getLogger(__name__)
 _startup_logger.info("RUNNING NEW BUILD")
+validate_vc_gateway_config()
 
 # ── Flask health-check server ─────────────────────────────────────────────────
 

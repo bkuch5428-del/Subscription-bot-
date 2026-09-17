@@ -1,3 +1,4 @@
+import logging
 import os
 from dotenv import load_dotenv
 
@@ -60,7 +61,15 @@ VC_GATEWAY_ENABLED: bool = os.getenv("VC_GATEWAY_ENABLED", "false").strip().lowe
 VC_GATEWAY_API_URL: str = os.getenv(
     "VC_GATEWAY_API_URL",
     "https://vcgatewaypro.com/payment_api.php",
-).strip()
+).strip() or "https://vcgatewaypro.com/payment_api.php"
+
+
+def validate_vc_gateway_config() -> bool:
+    """Log a safe warning when VC Gateway verification cannot authenticate."""
+    if not VC_GATEWAY_API_KEY:
+        logging.getLogger(__name__).warning("VC Gateway API key is not configured")
+        return False
+    return True
 
 
 def get_famapp_runtime_config() -> dict[str, str | int]:
