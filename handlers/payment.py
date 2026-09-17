@@ -95,6 +95,7 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 _IST = timezone(timedelta(hours=5, minutes=30))
+_VC_ORDER_ID_PATTERN = re.compile(r"^ORD\d{6}[A-Z0-9]{6}$")
 
 # user_id -> { order_id, plan_name, plan_price, plan_validity, access_link, final_price }
 _awaiting_proof: dict[int, dict] = {}
@@ -235,6 +236,10 @@ def _make_vc_order_id() -> str:
     return f"ORD{stamp}{suffix}"
 
 
+def _is_valid_vc_order_id(order_id: str | None) -> bool:
+    return bool(_VC_ORDER_ID_PATTERN.fullmatch(str(order_id or "")))
+
+
 def _build_vc_upi_uri(amount: str | Decimal, vc_order_id: str) -> str:
     params = {
         "pa": VC_GATEWAY_UPI_ID,
@@ -313,6 +318,13 @@ async def verify_vc_gateway_payment(order: dict) -> tuple[str, dict | None]:
     """Query VC Gateway using only stored order values and validate its response."""
     if not VC_GATEWAY_API_KEY:
         logger.warning("VC Gateway API key is not configured")
+        return "ERROR", None
+    if not _is_valid_vc_order_id(order.get("vc_order_id")):
+        logger.warning(
+            "VC order rejected internal_order_id=%s reason=invalid_provider_order_id provider_order_id=%s",
+            order.get("order_id"),
+            order.get("vc_order_id"),
+        )
         return "ERROR", None
     amount_sent = _format_amount(order["expected_amount"])
     logger.info(
