@@ -18,7 +18,7 @@ import handlers.payment as payment  # noqa: E402
 class VcGatewayTests(unittest.TestCase):
     def test_qr_contains_stored_amount_and_vc_order_id(self):
         with patch.object(payment, "VC_GATEWAY_UPI_ID", "merchant@example"):
-            provider_order_id = "ORD260917ABC123"
+            provider_order_id = "VC2609171412446FEE8B01"
             uri = payment._build_vc_upi_uri("129.50", provider_order_id)
         query = parse_qs(urlsplit(uri).query)
         self.assertEqual(query["pa"], ["merchant@example"])
@@ -30,10 +30,16 @@ class VcGatewayTests(unittest.TestCase):
 
     def test_provider_order_id_uses_gateway_format(self):
         order_id = payment._make_vc_order_id()
-        self.assertRegex(order_id, r"^ORD\d{6}[A-Z0-9]{6}$")
+        self.assertRegex(order_id, r"^VC\d{12}[0-9A-F]{8}$")
+        self.assertFalse(order_id.startswith("ORD"))
         self.assertTrue(payment._is_valid_vc_order_id(order_id))
-        self.assertTrue(payment._is_valid_vc_order_id("ORDER123"))
         self.assertTrue(payment._is_valid_vc_order_id("VC2609171412446FEE8B01"))
+        self.assertFalse(payment._is_valid_vc_order_id("ORD260917ABC123"))
+
+    def test_vc_provider_id_starts_with_uppercase_vc(self):
+        provider_order_id = payment._make_vc_order_id()
+        self.assertTrue(provider_order_id.startswith("VC"))
+        self.assertFalse(provider_order_id.startswith(("ve", "vo", "ORD", "vc")))
 
     def test_response_parser_handles_json_and_plain_statuses(self):
         parsed = payment._parse_vc_gateway_response(
@@ -82,7 +88,7 @@ class VcGatewayTests(unittest.TestCase):
             "order_id": "ORD1",
             "user_id": 7,
             "payment_provider": "vc_gateway",
-            "vc_order_id": "ORD260917ABC123",
+            "vc_order_id": "VC2609171412446FEE8B01",
             "expected_amount": "10.00",
         }
 
@@ -97,7 +103,7 @@ class VcGatewayTests(unittest.TestCase):
             result, _summary = asyncio.run(verify('{"status":"%s"}' % status))
             self.assertEqual(result, status)
 
-        success, _summary = asyncio.run(verify('{"status":"SUCCESS","order_id":"ORD260917ABC123","amount":"10.00"}'))
+        success, _summary = asyncio.run(verify('{"status":"SUCCESS","order_id":"VC2609171412446FEE8B01","amount":"10.00"}'))
         self.assertEqual(success, "SUCCESS")
         mismatch, _summary = asyncio.run(verify('{"status":"SUCCESS","order_id":"VC1","amount":"11.00"}'))
         self.assertEqual(mismatch, "ERROR")
@@ -124,7 +130,7 @@ class VcGatewayTests(unittest.TestCase):
     def test_success_requires_provider_order_id_and_amount(self):
         order = {
             "order_id": "ORD1",
-            "vc_order_id": "ORD260917ABC123",
+            "vc_order_id": "VC2609171412446FEE8B01",
             "expected_amount": "39.00",
         }
 
@@ -162,7 +168,7 @@ class VcGatewayTests(unittest.TestCase):
         self.assertEqual(asyncio.run(verify('{"status":"SUCCESS","order_id":"VC1"}'))[0], "ERROR")
 
     def test_invalid_order_id_gateway_message_is_not_payment_failed(self):
-        order = {"order_id": "ORD1", "vc_order_id": "ORD260917ABC123", "expected_amount": "1"}
+        order = {"order_id": "ORD1", "vc_order_id": "VC2609171412446FEE8B01", "expected_amount": "1"}
 
         class FakeResponse:
             status = 200
@@ -175,7 +181,7 @@ class VcGatewayTests(unittest.TestCase):
                 return None
 
             async def text(self):
-                return '{"status":"failed","message":"Payment received","order_id":"ORD260917ABC123","gateway_message":"Invalid Order Id."}'
+                return '{"status":"failed","message":"Payment received","order_id":"VC2609171412446FEE8B01","gateway_message":"Invalid Order Id."}'
 
         class FakeSession:
             async def __aenter__(self):
@@ -243,7 +249,7 @@ class VcGatewayTests(unittest.TestCase):
             "plan_name": "Gold",
             "expected_amount": "1",
             "payment_provider": "vc_gateway",
-            "vc_order_id": "ORD260917ABC123",
+            "vc_order_id": "VC2609171412446FEE8B01",
             "payment_status": "created",
             "expires_at": None,
             "status_message_id": 55,
@@ -290,7 +296,7 @@ class VcGatewayTests(unittest.TestCase):
             "plan_validity": "30 days",
             "access_link": "https://example.com/access",
             "payment_provider": "vc_gateway",
-            "vc_order_id": "ORD260917ABC123",
+            "vc_order_id": "VC2609171412446FEE8B01",
             "payment_status": "created",
             "expires_at": None,
             "status_message_id": 55,
@@ -335,7 +341,7 @@ class VcGatewayTests(unittest.TestCase):
             "plan_name": "Gold",
             "expected_amount": "39.00",
             "payment_provider": "vc_gateway",
-            "vc_order_id": "ORD260917ABC123",
+            "vc_order_id": "VC2609171412446FEE8B01",
             "payment_status": "created",
             "expires_at": None,
             "status_message_id": 55,
@@ -381,7 +387,7 @@ class VcGatewayTests(unittest.TestCase):
             "plan_name": "Gold",
             "expected_amount": "39.00",
             "payment_provider": "vc_gateway",
-            "vc_order_id": "ORD260917ABC123",
+            "vc_order_id": "VC2609171412446FEE8B01",
             "payment_status": "created",
             "expires_at": None,
             "status_message_id": 55,
@@ -471,7 +477,7 @@ class VcGatewayTests(unittest.TestCase):
                 return FakeResponse()
 
         session = FakeSession()
-        order = {"order_id": "ORD-INTERNAL", "vc_order_id": "ORD260917ABC123", "expected_amount": "39.00"}
+        order = {"order_id": "ORD-INTERNAL", "vc_order_id": "VC2609171412446FEE8B01", "expected_amount": "39.00"}
         async def verify():
             with (
                 patch.object(payment, "VC_GATEWAY_API_KEY", "secret"),
@@ -494,7 +500,7 @@ class VcGatewayTests(unittest.TestCase):
         self.assertNotIn("secret", repr(info.call_args_list))
 
     def test_missing_gateway_api_key_is_configuration_error_and_is_not_logged(self):
-        order = {"order_id": "ORD1", "vc_order_id": "ORD260917ABC123", "expected_amount": "39.00"}
+        order = {"order_id": "ORD1", "vc_order_id": "VC2609171412446FEE8B01", "expected_amount": "39.00"}
         with patch.object(payment, "VC_GATEWAY_API_KEY", ""), patch.object(
             payment.logger, "warning"
         ) as warning:
@@ -631,14 +637,44 @@ class VcGatewayTests(unittest.TestCase):
         self.assertEqual(len(created), 2)
         self.assertNotEqual(created[0]["order_id"], created[1]["order_id"])
         self.assertNotEqual(created[0]["vc_order_id"], created[1]["vc_order_id"])
+        self.assertTrue(created[0]["order_id"].startswith("ORD"))
         self.assertEqual(created[0]["payment_provider"], "vc_gateway")
         self.assertEqual(created[0]["final_price"], "199")
-        self.assertRegex(created[0]["vc_order_id"], r"^ORD\d{6}[A-Z0-9]{6}$")
+        self.assertRegex(created[0]["vc_order_id"], r"^VC\d{12}[0-9A-F]{8}$")
         first_qr_uri = payment._build_vc_upi_uri("199", created[0]["vc_order_id"])
         self.assertIn(created[0]["vc_order_id"], first_qr_uri)
         payment_texts = [call.args[1] for call in bot.send_message.call_args_list]
         self.assertIn(created[0]["vc_order_id"], payment_texts[0])
         self.assertIn(created[1]["vc_order_id"], payment_texts[1])
+
+    def test_vc_payment_message_never_contains_internal_ord_id(self):
+        bot = AsyncMock()
+        bot.send_photo.return_value = SimpleNamespace(message_id=10)
+        bot.send_message.return_value = SimpleNamespace(message_id=11)
+        plan = {
+            "name": "Gold",
+            "price": "199",
+            "validity": "30 days",
+            "access_link": "https://example.com/access",
+        }
+
+        async def record_order(**kwargs):
+            return None
+
+        async def run():
+            with (
+                patch.object(payment, "VC_GATEWAY_UPI_ID", "merchant@example"),
+                patch.object(payment, "create_order", new=record_order),
+                patch.object(payment, "supersede_active_orders", new=AsyncMock()),
+                patch.object(payment, "update_order_messages", new=AsyncMock()),
+                patch.object(payment, "set_pending_reminder", new=AsyncMock()),
+            ):
+                await payment.create_vc_gateway_payment(bot, 7, 7, plan, 3, "199", "Price", 0)
+
+        asyncio.run(run())
+        payment_text = bot.send_message.call_args.args[1]
+        self.assertRegex(payment_text, r"VC Order ID:</b> <code>VC\d{12}[0-9A-F]{8}</code>")
+        self.assertNotRegex(payment_text, r"ORD\d")
 
     def test_order_provider_rejects_cross_provider_callbacks(self):
         self.assertEqual(payment._order_provider({"payment_provider": "vc_gateway"}), "vc_gateway")

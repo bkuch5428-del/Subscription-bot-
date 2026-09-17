@@ -230,13 +230,12 @@ def _order_provider(order: dict) -> str:
 
 
 def _make_vc_order_id() -> str:
-    stamp = datetime.now(timezone.utc).strftime("%y%m%d")
-    suffix = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
-    return f"ORD{stamp}{suffix}"
+    stamp = datetime.now(timezone.utc).strftime("%y%m%d%H%M%S")
+    return f"VC{stamp}{secrets.token_hex(4).upper()}"
 
 
 def _is_valid_vc_order_id(order_id: str | None) -> bool:
-    return bool(str(order_id or "").strip())
+    return bool(re.fullmatch(r"VC\d{12}[0-9A-F]{8}", str(order_id or "").strip()))
 
 
 def _build_vc_upi_uri(amount: str | Decimal, vc_order_id: str) -> str:
