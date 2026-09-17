@@ -40,6 +40,7 @@ class VcGatewayTests(unittest.TestCase):
 
             def __init__(self, body):
                 self.body = body
+                self.headers = {"Content-Type": "application/json"}
 
             async def __aenter__(self):
                 return self
@@ -61,6 +62,8 @@ class VcGatewayTests(unittest.TestCase):
                 return None
 
             def get(self, *_args, **_kwargs):
+                self.request_args = _args
+                self.request_kwargs = _kwargs
                 return FakeResponse(self.body)
 
         order = {
@@ -86,6 +89,53 @@ class VcGatewayTests(unittest.TestCase):
         self.assertEqual(success, "SUCCESS")
         mismatch, _summary = asyncio.run(verify('{"status":"SUCCESS","order_id":"VC1","amount":"11.00"}'))
         self.assertEqual(mismatch, "INVALID")
+
+        missing_optional, _summary = asyncio.run(verify('{"status":"success"}'))
+        self.assertEqual(missing_optional, "SUCCESS")
+
+    def test_gateway_request_uses_vc_order_id_and_expected_amount(self):
+        class FakeResponse:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def text(self):
+                return '{"status":"PENDING"}'
+
+        class FakeSession:
+            def __init__(self, **_kwargs):
+                self.params = None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def get(self, url, **kwargs):
+                self.url = url
+                self.params = kwargs["params"]
+                return FakeResponse()
+
+        session = FakeSession()
+        order = {"order_id": "ORD-INTERNAL", "vc_order_id": "VC-STORED", "expected_amount": "39.00"}
+        async def verify():
+            with (
+                patch.object(payment, "VC_GATEWAY_API_KEY", "secret"),
+                patch.object(payment.aiohttp, "ClientSession", return_value=session),
+            ):
+                return await payment.verify_vc_gateway_payment(order)
+
+        result, _summary = asyncio.run(verify())
+        self.assertEqual(result, "PENDING")
+        self.assertEqual(session.params["order_id"], "VC-STORED")
+        self.assertEqual(session.params["amount"], "39")
+        self.assertNotEqual(session.params["order_id"], order["order_id"])
 
     def test_provider_settings_default_to_famapp_and_manual(self):
         async def setting(_key, default=""):

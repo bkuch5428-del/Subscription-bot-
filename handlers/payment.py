@@ -234,7 +234,8 @@ def _generate_vc_qr_bytes(amount: str | Decimal, vc_order_id: str) -> bytes:
 def _find_response_value(payload, names: set[str]):
     if isinstance(payload, dict):
         for key, value in payload.items():
-            if str(key).lower().replace("-", "_") in names:
+            normalized_key = str(key).strip().lower().replace("-", "_").replace(" ", "_")
+            if normalized_key in names:
                 return value
         for value in payload.values():
             found = _find_response_value(value, names)
@@ -263,18 +264,29 @@ def _parse_vc_gateway_response(raw: str) -> dict | None:
     if status is None:
         return None
     return {
-        "status": str(status).upper(),
+        "status": str(status or "").strip().upper(),
         "order_id": _find_response_value(payload, {"order_id", "orderid", "transaction_order_id"}),
         "amount": _find_response_value(payload, {"amount", "paid_amount", "paidamount", "transaction_amount"}),
     }
+
+
+def _safe_vc_response_preview(raw: str, api_key: str) -> str:
+    preview = str(raw or "").replace(api_key, "<redacted>")
+    return preview[:2000]
 
 
 async def verify_vc_gateway_payment(order: dict) -> tuple[str, dict | None]:
     """Query VC Gateway using only stored order values and validate its response."""
     if not VC_GATEWAY_API_KEY:
         logger.warning("VC API request rejected order_id=%s reason=missing_configuration", order.get("order_id"))
-        return "INVALID", None
-    logger.info("VC API request started order_id=%s vc_order_id=%s", order.get("order_id"), order.get("vc_order_id"))
+        return "ERROR", None
+    amount_sent = _format_amount(order["expected_amount"])
+    logger.info(
+        "VC API request started internal_order_id=%s vc_order_id=%s expected_amount=%s "
+        "amount_sent=%s endpoint=%s",
+        order.get("order_id"), order.get("vc_order_id"), order.get("expected_amount"),
+        amount_sent, VC_GATEWAY_API_URL,
+    )
     try:
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -283,27 +295,44 @@ async def verify_vc_gateway_payment(order: dict) -> tuple[str, dict | None]:
                 params={
                     "api_key": VC_GATEWAY_API_KEY,
                     "order_id": order["vc_order_id"],
-                    "amount": _format_amount(order["expected_amount"]),
+                    "amount": amount_sent,
                 },
             ) as response:
                 raw = await response.text()
+                content_type = getattr(response, "headers", {}).get("Content-Type", "")
+                logger.info(
+                    "VC API response received internal_order_id=%s vc_order_id=%s "
+                    "http_status=%s content_type=%s raw_response=%s",
+                    order.get("order_id"), order.get("vc_order_id"), response.status,
+                    content_type, _safe_vc_response_preview(raw, VC_GATEWAY_API_KEY),
+                )
                 if response.status < 200 or response.status >= 300:
                     logger.warning("VC API response rejected order_id=%s http_status=%s", order.get("order_id"), response.status)
-                    return "INVALID", None
+                    return "ERROR", None
     except Exception as exc:
         logger.exception("VC API request failed order_id=%s exception_type=%s", order.get("order_id"), type(exc).__name__)
-        return "FAILED", None
+        return "ERROR", None
 
     parsed = _parse_vc_gateway_response(raw)
-    logger.info("VC response parsed order_id=%s status=%s", order.get("order_id"), (parsed or {}).get("status"))
+    logger.info(
+        "VC response parsed internal_order_id=%s vc_order_id=%s parsed_status=%s "
+        "parsed_order_id=%s parsed_amount=%s",
+        order.get("order_id"), order.get("vc_order_id"), (parsed or {}).get("status"),
+        (parsed or {}).get("order_id"), (parsed or {}).get("amount"),
+    )
     if not parsed or parsed.get("status") not in {"SUCCESS", "PENDING", "FAILED", "INVALID", "NOT_FOUND"}:
-        return "INVALID", parsed
-    if parsed["status"] == "SUCCESS" and (
-        str(parsed.get("order_id")) != str(order.get("vc_order_id"))
-        or not _amounts_equal(parsed.get("amount"), order.get("expected_amount"))
-    ):
-        logger.warning("VC response rejected order_id=%s reason=provider_order_or_amount_mismatch", order.get("order_id"))
-        return "INVALID", parsed
+        logger.warning("VC response rejected order_id=%s reason=missing_or_unknown_status", order.get("order_id"))
+        return "ERROR", parsed
+    if parsed["status"] == "SUCCESS":
+        returned_order_id = parsed.get("order_id")
+        returned_amount = parsed.get("amount")
+        if returned_order_id is not None and str(returned_order_id).strip() != str(order.get("vc_order_id")):
+            logger.warning("VC response rejected order_id=%s reason=provider_order_id_mismatch", order.get("order_id"))
+            return "INVALID", parsed
+        if returned_amount is not None and not _amounts_equal(returned_amount, order.get("expected_amount")):
+            logger.warning("VC response rejected order_id=%s reason=provider_amount_mismatch", order.get("order_id"))
+            return "INVALID", parsed
+        logger.info("VC response SUCCESS validation passed order_id=%s", order.get("order_id"))
     return parsed["status"], parsed
 
 
@@ -1745,6 +1774,7 @@ async def callback_vc_check(call: CallbackQuery, bot: Bot) -> None:
             "FAILED": "❌ VC Gateway reports that this payment failed. Please generate a new QR and try again.",
             "INVALID": "⚠️ VC Gateway returned an invalid payment response. Please contact support if you have already paid.",
             "NOT_FOUND": "⚠️ VC Gateway could not find this payment yet. Please wait a moment and try again.",
+            "ERROR": "⚠️ Payment verification is temporarily unavailable. Please try again shortly.",
         }
         await _edit_or_create_status_message(call, bot, user.id, order_id, info, messages.get(provider_status, messages["INVALID"]), vc_payment_keyboard(order_id))
         logger.info("VC payment %s order_id=%s", provider_status.lower(), order_id)
