@@ -1,6 +1,7 @@
 import asyncio
 import os
 import unittest
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -91,7 +92,223 @@ class VcGatewayTests(unittest.TestCase):
         self.assertEqual(mismatch, "INVALID")
 
         missing_optional, _summary = asyncio.run(verify('{"status":"success"}'))
-        self.assertEqual(missing_optional, "SUCCESS")
+        self.assertEqual(missing_optional, "INVALID")
+
+    def test_response_parser_normalizes_nested_and_human_status_values(self):
+        parsed = payment._parse_vc_gateway_response(
+            '{"DATA":{"PAYMENT_STATUS":"success","ORDER_ID":"VC1","AMOUNT":39.0}}'
+        )
+        self.assertEqual(parsed, {
+            "status": "SUCCESS",
+            "order_id": "VC1",
+            "amount": 39.0,
+        })
+        self.assertEqual(
+            payment._parse_vc_gateway_response('{"status":"not found"}')['status'],
+            "NOT_FOUND",
+        )
+
+    def test_success_requires_provider_order_id_and_amount(self):
+        order = {
+            "order_id": "ORD1",
+            "vc_order_id": "VC1",
+            "expected_amount": "39.00",
+        }
+
+        async def verify(body):
+            class FakeResponse:
+                status = 200
+                headers = {"Content-Type": "application/json"}
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *_args):
+                    return None
+
+                async def text(self):
+                    return body
+
+            class FakeSession:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *_args):
+                    return None
+
+                def get(self, *_args, **_kwargs):
+                    return FakeResponse()
+
+            with (
+                patch.object(payment, "VC_GATEWAY_API_KEY", "secret"),
+                patch.object(payment.aiohttp, "ClientSession", return_value=FakeSession()),
+            ):
+                return await payment.verify_vc_gateway_payment(order)
+
+        self.assertEqual(asyncio.run(verify('{"status":"SUCCESS","amount":"39"}'))[0], "INVALID")
+        self.assertEqual(asyncio.run(verify('{"status":"SUCCESS","order_id":"VC1"}'))[0], "INVALID")
+
+    def test_vc_check_pending_failed_and_unknown_keep_payment_open(self):
+        order = {
+            "order_id": "ORD1",
+            "user_id": 7,
+            "plan_id": 3,
+            "plan_name": "Gold",
+            "plan_price": "39",
+            "expected_amount": "39.00",
+            "plan_validity": "30 days",
+            "access_link": "https://example.com/access",
+            "payment_provider": "vc_gateway",
+            "vc_order_id": "VC1",
+            "payment_status": "created",
+            "expires_at": None,
+            "status_message_id": 55,
+        }
+
+        class DummyCall:
+            data = "vc_check:ORD1"
+            from_user = SimpleNamespace(id=7, first_name="Demo")
+            message = SimpleNamespace()
+            answer = AsyncMock()
+
+        async def run(provider_status):
+            with (
+                patch.object(payment, "get_order", new=AsyncMock(return_value=order)),
+                patch.object(payment, "verify_vc_gateway_payment", new=AsyncMock(return_value=(provider_status, {"status": provider_status}))),
+                patch.object(payment, "save_provider_response_summary", new=AsyncMock()),
+                patch.object(payment, "_edit_or_create_status_message", new=AsyncMock()) as edit,
+                patch.object(payment, "approve_vc_gateway_order", new=AsyncMock()) as approve,
+            ):
+                await payment.callback_vc_check(DummyCall(), AsyncMock())
+            return edit, approve
+
+        for provider_status, expected_text in (
+            ("PENDING", "Payment not detected yet. Please wait a moment and try again."),
+            ("FAILED", "VC Gateway reports that this payment failed."),
+            ("INVALID", "VC Gateway returned an invalid payment response."),
+            ("NOT_FOUND", "VC Gateway could not find this payment yet."),
+            ("ERROR", "Payment verification is temporarily unavailable."),
+        ):
+            edit, approve = asyncio.run(run(provider_status))
+            self.assertFalse(approve.await_args_list)
+            self.assertTrue(
+                any(expected_text in repr(call.args) for call in edit.await_args_list),
+                f"{provider_status}: {edit.await_args_list}",
+            )
+            self.assertIsNotNone(edit.await_args_list[-1].args[6])
+
+    def test_vc_success_activates_once_and_delivers_access_link(self):
+        order = {
+            "order_id": "ORD1",
+            "user_id": 7,
+            "plan_name": "Gold",
+            "expected_amount": "39.00",
+            "payment_provider": "vc_gateway",
+            "vc_order_id": "VC1",
+            "payment_status": "created",
+            "expires_at": None,
+            "status_message_id": 55,
+        }
+
+        class DummyCall:
+            data = "vc_check:ORD1"
+            from_user = SimpleNamespace(id=7, first_name="Demo")
+            message = SimpleNamespace()
+            answer = AsyncMock()
+
+        approved = {
+            "plan_name": "Gold",
+            "plan_validity": "30 days",
+            "subscription_end": datetime.now(timezone.utc),
+            "access_link": "https://example.com/access",
+        }
+
+        async def run(approval):
+            with (
+                patch.object(payment, "get_order", new=AsyncMock(return_value=order)),
+                patch.object(payment, "verify_vc_gateway_payment", new=AsyncMock(return_value=("SUCCESS", {"status": "SUCCESS", "order_id": "VC1", "amount": "39.00"}))),
+                patch.object(payment, "save_provider_response_summary", new=AsyncMock()),
+                patch.object(payment, "approve_vc_gateway_order", new=AsyncMock(return_value=approval)) as approve,
+                patch.object(payment, "log_payment_success", new=AsyncMock()),
+                patch.object(payment, "_edit_or_create_status_message", new=AsyncMock()) as edit,
+            ):
+                await payment.callback_vc_check(DummyCall(), AsyncMock())
+            return approve, edit
+
+        approve, edit = asyncio.run(run(approved))
+        approve.assert_awaited_once()
+        self.assertIn("https://example.com/access", edit.await_args_list[-1].args[5])
+
+        approve, edit = asyncio.run(run(None))
+        approve.assert_awaited_once()
+        self.assertIn("already activated", edit.await_args_list[-1].args[5])
+
+    def test_repeated_vc_status_checks_reuse_current_status_message(self):
+        order = {
+            "order_id": "ORD1",
+            "user_id": 7,
+            "plan_name": "Gold",
+            "expected_amount": "39.00",
+            "payment_provider": "vc_gateway",
+            "vc_order_id": "VC1",
+            "payment_status": "created",
+            "expires_at": None,
+            "status_message_id": 55,
+        }
+
+        class DummyCall:
+            data = "vc_check:ORD1"
+            from_user = SimpleNamespace(id=7, first_name="Demo")
+            message = SimpleNamespace()
+            answer = AsyncMock()
+
+        async def run():
+            with (
+                patch.object(payment, "get_order", new=AsyncMock(return_value=order)),
+                patch.object(payment, "verify_vc_gateway_payment", new=AsyncMock(return_value=("PENDING", {"status": "PENDING"}))),
+                patch.object(payment, "save_provider_response_summary", new=AsyncMock()),
+                patch.object(payment, "_edit_or_create_status_message", new=AsyncMock()) as edit,
+            ):
+                await payment.callback_vc_check(DummyCall(), AsyncMock())
+                await payment.callback_vc_check(DummyCall(), AsyncMock())
+            return edit
+
+        edit = asyncio.run(run())
+        final_infos = [call.args[4] for call in edit.await_args_list if len(call.args) > 5]
+        self.assertEqual(len(final_infos), 4)
+        self.assertTrue(all(info["status_message_id"] == 55 for info in final_infos))
+
+    def test_vc_check_rejects_expired_and_superseded_orders_before_api_call(self):
+        class DummyCall:
+            data = "vc_check:ORD1"
+            from_user = SimpleNamespace(id=7, first_name="Demo")
+            message = SimpleNamespace()
+            answer = AsyncMock()
+
+        for payment_status, expires_at in (
+            ("superseded", None),
+            ("created", datetime.now(timezone.utc) - timedelta(minutes=1)),
+        ):
+            order = {
+                "order_id": "ORD1",
+                "user_id": 7,
+                "payment_provider": "vc_gateway",
+                "payment_status": payment_status,
+                "expires_at": expires_at,
+                "status_message_id": 55,
+            }
+            async def run():
+                with (
+                    patch.object(payment, "get_order", new=AsyncMock(return_value=order)),
+                    patch.object(payment, "verify_vc_gateway_payment", new=AsyncMock()) as verify,
+                    patch.object(payment, "update_order_status", new=AsyncMock()),
+                    patch.object(payment, "_edit_or_create_status_message", new=AsyncMock()),
+                ):
+                    await payment.callback_vc_check(DummyCall(), AsyncMock())
+                return verify
+
+            verify = asyncio.run(run())
+            verify.assert_not_awaited()
 
     def test_gateway_request_uses_vc_order_id_and_expected_amount(self):
         class FakeResponse:
@@ -155,6 +372,65 @@ class VcGatewayTests(unittest.TestCase):
     def test_invalid_active_provider_falls_back_to_famapp(self):
         with patch.object(payment, "get_setting", new=AsyncMock(return_value="unknown")):
             self.assertEqual(asyncio.run(payment._active_payment_provider()), "famapp")
+
+    def test_active_provider_is_normalized_from_the_single_setting(self):
+        with patch.object(payment, "get_setting", new=AsyncMock(return_value="  VC_GATEWAY ")):
+            self.assertEqual(asyncio.run(payment.get_active_payment_provider()), "vc_gateway")
+
+    def test_buy_routes_only_to_the_selected_provider(self):
+        class DummyMessage:
+            chat = SimpleNamespace(id=123)
+            answer = AsyncMock(return_value=SimpleNamespace(message_id=99, delete=AsyncMock()))
+
+        class DummyCall:
+            data = "buy:3"
+            message = DummyMessage()
+            from_user = SimpleNamespace(id=7, first_name="Demo")
+            answer = AsyncMock()
+
+        async def run(provider):
+            with (
+                patch.object(payment, "get_active_payment_provider", new=AsyncMock(return_value=provider)),
+                patch.object(payment, "get_plan", new=AsyncMock(return_value={
+                    "name": "Gold",
+                    "price": "199",
+                    "validity": "30 days",
+                    "access_link": "https://example.com/access",
+                })),
+                patch.object(payment, "cancel_start_reminders", new=AsyncMock()),
+                patch.object(payment, "user_has_active_plan", new=AsyncMock(return_value=False)),
+                patch.object(payment, "log_payment_started", new=AsyncMock()),
+                patch.object(payment, "clear_plan_interest", new=AsyncMock()),
+                patch.object(payment, "get_user_referral_info", new=AsyncMock(return_value={"referral_discount": 0})),
+                patch.object(payment, "_send_payment_screen", new=AsyncMock(return_value="FAM-1")) as famapp,
+                patch.object(payment, "_send_manual_payment_screen", new=AsyncMock(return_value="MAN-1")) as manual,
+                patch.object(payment, "create_vc_gateway_payment", new=AsyncMock(return_value="VC-1")) as vc,
+            ):
+                await payment.callback_buy(DummyCall(), AsyncMock())
+            return famapp, manual, vc
+
+        for provider, expected in (
+            ("famapp", "famapp"),
+            ("manual", "manual"),
+            ("vc_gateway", "vc_gateway"),
+        ):
+            famapp, manual, vc = asyncio.run(run(provider))
+            calls = {"famapp": famapp, "manual": manual, "vc_gateway": vc}
+            calls[expected].assert_awaited_once()
+            for name, mock in calls.items():
+                if name != expected:
+                    mock.assert_not_awaited()
+
+    def test_legacy_payment_method_callback_does_not_override_active_provider(self):
+        call = SimpleNamespace(
+            data="payment_method:3:famapp",
+            message=SimpleNamespace(),
+            answer=AsyncMock(),
+        )
+        bot = AsyncMock()
+        with patch.object(payment, "callback_buy", new=AsyncMock()) as callback_buy:
+            asyncio.run(payment.callback_payment_method(call, bot))
+        callback_buy.assert_awaited_once_with(call, bot, plan_id=3)
 
     def test_legacy_provider_selection_callback_routes_directly(self):
         call = SimpleNamespace(

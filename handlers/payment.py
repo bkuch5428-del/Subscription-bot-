@@ -80,7 +80,6 @@ from keyboards.menu import (
     main_menu_keyboard,
     plans_list_keyboard,
     payment_retry_keyboard,
-    payment_provider_keyboard,
     vc_payment_keyboard,
     regenerate_payment_qr_keyboard,
 )
@@ -191,12 +190,36 @@ async def _enabled_payment_providers() -> list[str]:
     return enabled
 
 
-async def _active_payment_provider() -> str | None:
-    provider = str(await get_setting("active_payment_provider", "famapp") or "famapp").strip().lower()
-    if provider in {"famapp", "manual", "vc_gateway"}:
-        return provider
-    logger.warning("Invalid active_payment_provider=%r; falling back to FamApp", provider)
-    return "famapp"
+async def get_active_payment_provider() -> str:
+    """Read and normalize the single provider setting used for new payments."""
+    raw_provider = await get_setting("active_payment_provider", None)
+    source = "settings.active_payment_provider" if raw_provider is not None else "default:famapp"
+    normalized_provider = str(raw_provider).strip().lower() if raw_provider is not None else "famapp"
+    if raw_provider is None:
+        logger.warning(
+            "Missing payment provider user_setting source=%s normalized=famapp; falling back to famapp",
+            source,
+        )
+    if normalized_provider not in {"famapp", "manual", "vc_gateway"}:
+        logger.warning(
+            "Invalid payment provider user_setting=%r source=%s normalized=%r; falling back to famapp",
+            raw_provider,
+            source,
+            normalized_provider,
+        )
+        normalized_provider = "famapp"
+    logger.info(
+        "Active payment provider source=%s raw=%r normalized=%s",
+        source,
+        raw_provider,
+        normalized_provider,
+    )
+    return normalized_provider
+
+
+async def _active_payment_provider() -> str:
+    """Backward-compatible alias for tests and older integrations."""
+    return await get_active_payment_provider()
 
 
 def _order_provider(order: dict) -> str:
@@ -257,14 +280,22 @@ def _parse_vc_gateway_response(raw: str) -> dict | None:
         import json
         payload = json.loads(text)
     except (TypeError, ValueError):
-        upper = text.upper()
-        status = next((value for value in ("SUCCESS", "PENDING", "FAILED", "INVALID", "NOT_FOUND") if value in upper), None)
+        normalized_text = re.sub(r"[\s-]+", "_", text.upper())
+        status = next(
+            (
+                value
+                for value in ("SUCCESS", "PENDING", "FAILED", "INVALID", "NOT_FOUND")
+                if value in normalized_text
+            ),
+            None,
+        )
         return {"status": status} if status else None
     status = _find_response_value(payload, {"status", "payment_status", "paymentstatus"})
     if status is None:
         return None
+    normalized_status = re.sub(r"[\s-]+", "_", str(status).strip().upper())
     return {
-        "status": str(status or "").strip().upper(),
+        "status": normalized_status,
         "order_id": _find_response_value(payload, {"order_id", "orderid", "transaction_order_id"}),
         "amount": _find_response_value(payload, {"amount", "paid_amount", "paidamount", "transaction_amount"}),
     }
@@ -326,10 +357,10 @@ async def verify_vc_gateway_payment(order: dict) -> tuple[str, dict | None]:
     if parsed["status"] == "SUCCESS":
         returned_order_id = parsed.get("order_id")
         returned_amount = parsed.get("amount")
-        if returned_order_id is not None and str(returned_order_id).strip() != str(order.get("vc_order_id")):
+        if returned_order_id is None or str(returned_order_id).strip() != str(order.get("vc_order_id")):
             logger.warning("VC response rejected order_id=%s reason=provider_order_id_mismatch", order.get("order_id"))
             return "INVALID", parsed
-        if returned_amount is not None and not _amounts_equal(returned_amount, order.get("expected_amount")):
+        if returned_amount is None or not _amounts_equal(returned_amount, order.get("expected_amount")):
             logger.warning("VC response rejected order_id=%s reason=provider_amount_mismatch", order.get("order_id"))
             return "INVALID", parsed
         logger.info("VC response SUCCESS validation passed order_id=%s", order.get("order_id"))
@@ -1500,7 +1531,7 @@ async def callback_regenerate_payment_qr(call: CallbackQuery, bot: Bot) -> None:
         return
 
     if _order_provider(order) == "vc_gateway":
-        await callback_buy(call, bot, plan_id=plan_id, provider="vc_gateway")
+        await callback_buy(call, bot, plan_id=plan_id)
         if _awaiting_proof.get(call.from_user.id, {}).get("order_id") != order_id:
             try:
                 await call.message.delete()
@@ -1523,7 +1554,7 @@ async def callback_regenerate_payment_qr(call: CallbackQuery, bot: Bot) -> None:
             await call.message.edit_reply_markup(reply_markup=None)
         except Exception:
             logger.exception("Could not remove expired-payment button order_id=%s", order_id)
-    await callback_buy(call, bot, plan_id=plan_id, provider=_order_provider(order))
+    await callback_buy(call, bot, plan_id=plan_id)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("buy:"))
@@ -1531,7 +1562,6 @@ async def callback_buy(
     call: CallbackQuery,
     bot: Bot,
     plan_id: int | None = None,
-    provider: str | None = None,
 ) -> None:
     """User tapped Buy Now — load plan from DB, generate order, show payment details."""
     logger.info("BUY CALLBACK HIT callback_data=%s", call.data)
@@ -1614,12 +1644,16 @@ async def callback_buy(
             f"💳 <b>Final Price:</b> ₹{final_price_str}"
         )
 
-        selected_provider = provider or await _active_payment_provider()
-        if selected_provider is None:
-            await call.message.answer("Currently no payment method is available.\nPlease contact support.")
-            return
+        selected_provider = await get_active_payment_provider()
+        logger.info(
+            "BUY PROVIDER SELECTED user_id=%s plan_id=%s provider=%s source=settings.active_payment_provider",
+            user.id,
+            plan_id,
+            selected_provider,
+        )
 
         if selected_provider == "manual":
+            logger.info("BUY PROVIDER BRANCH user_id=%s provider=manual", user.id)
             new_order_id = await _send_manual_payment_screen(
                 bot=bot,
                 chat_id=call.message.chat.id,
@@ -1631,6 +1665,7 @@ async def callback_buy(
                 discount_pct=discount_pct,
             )
         elif selected_provider == "vc_gateway":
+            logger.info("BUY PROVIDER BRANCH user_id=%s provider=vc_gateway", user.id)
             new_order_id = await create_vc_gateway_payment(
                 bot=bot,
                 chat_id=call.message.chat.id,
@@ -1641,7 +1676,8 @@ async def callback_buy(
                 price_section=price_section,
                 discount_pct=discount_pct,
             )
-        else:
+        elif selected_provider == "famapp":
+            logger.info("BUY PROVIDER BRANCH user_id=%s provider=famapp", user.id)
             new_order_id = await _send_payment_screen(
                 bot=bot,
                 chat_id=call.message.chat.id,
@@ -1652,6 +1688,8 @@ async def callback_buy(
                 price_section=price_section,
                 discount_pct=discount_pct,
             )
+        else:
+            raise RuntimeError(f"Unsupported payment provider: {selected_provider}")
         if not new_order_id:
             raise RuntimeError("payment screen creation returned no order ID")
         generation_succeeded = True
@@ -1710,16 +1748,19 @@ async def callback_vc_check(call: CallbackQuery, bot: Bot) -> None:
             await call.message.edit_reply_markup(reply_markup=None)
             await call.answer("⚠️ This payment request is not available.", show_alert=True)
             return
-        info = _awaiting_proof.setdefault(user.id, {
-            "order_id": order_id,
-            "plan_id": order.get("plan_id"),
-            "plan_name": order.get("plan_name", ""),
-            "plan_price": order.get("plan_price", ""),
-            "final_price": order.get("expected_amount", ""),
-            "plan_validity": order.get("plan_validity", ""),
-            "access_link": order.get("access_link", ""),
-            "status_message_id": order.get("status_message_id"),
-        })
+        info = _awaiting_proof.get(user.id)
+        if not info or info.get("order_id") != order_id:
+            info = {
+                "order_id": order_id,
+                "plan_id": order.get("plan_id"),
+                "plan_name": order.get("plan_name", ""),
+                "plan_price": order.get("plan_price", ""),
+                "final_price": order.get("expected_amount", ""),
+                "plan_validity": order.get("plan_validity", ""),
+                "access_link": order.get("access_link", ""),
+                "status_message_id": order.get("status_message_id"),
+            }
+            _awaiting_proof[user.id] = info
         status = order.get("payment_status")
         if status in {"approved", "superseded", "cancelled", "rejected", "failed"}:
             await _edit_or_create_status_message(call, bot, user.id, order_id, info, "⚠️ This payment request is no longer available.")
@@ -1770,7 +1811,7 @@ async def callback_vc_check(call: CallbackQuery, bot: Bot) -> None:
                 await _edit_or_create_status_message(call, bot, user.id, order_id, info, "✅ <b>Your plan is already activated.</b>\n\nUse /status to check your subscription.", main_menu_keyboard())
             return
         messages = {
-            "PENDING": "⏳ Payment not received yet. Please wait a moment and try again.\n\n💡 If you have already paid, please contact support.",
+            "PENDING": "⏳ Payment not detected yet. Please wait a moment and try again.\n\n💡 If you have already paid, please contact support.",
             "FAILED": "❌ VC Gateway reports that this payment failed. Please generate a new QR and try again.",
             "INVALID": "⚠️ VC Gateway returned an invalid payment response. Please contact support if you have already paid.",
             "NOT_FOUND": "⚠️ VC Gateway could not find this payment yet. Please wait a moment and try again.",
