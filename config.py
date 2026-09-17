@@ -54,6 +54,14 @@ IMAP_APP_PASSWORD: str = os.getenv("IMAP_APP_PASSWORD", "").strip()
 IMAP_MAILBOX: str = os.getenv("IMAP_MAILBOX", "INBOX").strip() or "INBOX"
 IMAP_SENDER_FILTER: str = (os.getenv("IMAP_SENDER_FILTER") or "no-reply@famapp.in").strip() or "no-reply@famapp.in"
 
+VC_GATEWAY_API_KEY: str = os.getenv("VC_GATEWAY_API_KEY", "").strip()
+VC_GATEWAY_UPI_ID: str = os.getenv("VC_GATEWAY_UPI_ID", "").strip()
+VC_GATEWAY_ENABLED: bool = os.getenv("VC_GATEWAY_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+VC_GATEWAY_API_URL: str = os.getenv(
+    "VC_GATEWAY_API_URL",
+    "https://vcgatewaypro.com/payment_api.php",
+).strip()
+
 
 def get_famapp_runtime_config() -> dict[str, str | int]:
     """Return the configured FamApp runtime settings.

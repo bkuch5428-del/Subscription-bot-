@@ -66,6 +66,7 @@ from keyboards.menu import (
     referral_settings_keyboard,
     referral_reset_confirm_keyboard,
     payment_settings_keyboard,
+    payment_provider_settings_keyboard,
     admin_users_keyboard,
     admin_user_details_keyboard,
     maintenance_keyboard,
@@ -2069,6 +2070,30 @@ async def _payment_settings_panel(target) -> None:
         await target.answer(text, reply_markup=kb)
 
 
+async def _payment_provider_settings_panel(target) -> None:
+    states = {
+        "famapp": (await get_setting("famapp_enabled", "1")) == "1",
+        "manual": (await get_setting("manual_payment_enabled", "1")) == "1",
+        "vc_gateway": (await get_setting("vc_gateway_enabled", "0")) == "1",
+    }
+    text = (
+        "⚙️ <b>Payment Provider Settings</b>\n\n"
+        "FamApp and Manual Payment are enabled by default.\n"
+        f"FamApp: {'ON' if states['famapp'] else 'OFF'}\n"
+        f"Manual Payment: {'ON' if states['manual'] else 'OFF'}\n"
+        f"VC Gateway: {'ON' if states['vc_gateway'] else 'OFF'}\n\n"
+        "Select a provider to toggle it."
+    )
+    kb = payment_provider_settings_keyboard(states)
+    if isinstance(target, CallbackQuery):
+        try:
+            await target.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            await target.message.answer(text, reply_markup=kb)
+    else:
+        await target.answer(text, reply_markup=kb)
+
+
 @router.callback_query(lambda c: c.data == "admin_payment_settings")
 async def cb_payment_settings_panel(call: CallbackQuery) -> None:
     if not _is_admin(call.from_user.id):
@@ -2077,6 +2102,32 @@ async def cb_payment_settings_panel(call: CallbackQuery) -> None:
     await call.answer()
     _state.pop(call.from_user.id, None)
     await _payment_settings_panel(call)
+
+
+@router.callback_query(lambda c: c.data == "admin_payment_provider_settings")
+async def cb_payment_provider_settings(call: CallbackQuery) -> None:
+    if not _is_admin(call.from_user.id):
+        await call.answer("⛔ Unauthorised.", show_alert=True)
+        return
+    await call.answer()
+    await _payment_provider_settings_panel(call)
+
+
+@router.callback_query(lambda c: c.data in {"admin_pp_famapp", "admin_pp_manual", "admin_pp_vc_gateway"})
+async def cb_toggle_payment_provider(call: CallbackQuery) -> None:
+    if not _is_admin(call.from_user.id):
+        await call.answer("⛔ Unauthorised.", show_alert=True)
+        return
+    key_by_callback = {
+        "admin_pp_famapp": "famapp_enabled",
+        "admin_pp_manual": "manual_payment_enabled",
+        "admin_pp_vc_gateway": "vc_gateway_enabled",
+    }
+    key = key_by_callback[call.data]
+    current = (await get_setting(key, "0")) == "1"
+    await set_setting(key, "0" if current else "1")
+    await call.answer(f"{'Disabled' if current else 'Enabled'}.", show_alert=True)
+    await _payment_provider_settings_panel(call)
 
 
 @router.callback_query(lambda c: c.data == "admin_pm_automatic")

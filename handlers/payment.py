@@ -29,6 +29,7 @@ from html.parser import HTMLParser
 from io import BytesIO
 
 import qrcode
+import aiohttp
 from qrcode.constants import ERROR_CORRECT_H
 
 from aiogram import Router, Bot, F
@@ -48,6 +49,9 @@ from config import (
     IMAP_APP_PASSWORD,
     IMAP_MAILBOX,
     IMAP_SENDER_FILTER,
+    VC_GATEWAY_API_KEY,
+    VC_GATEWAY_API_URL,
+    VC_GATEWAY_UPI_ID,
 )
 from database import (
     create_order,
@@ -66,6 +70,8 @@ from database import (
     cancel_start_reminders,
     update_order_messages,
     update_order_status_message,
+    supersede_active_orders,
+    save_provider_response_summary,
 )
 from keyboards.menu import (
     payment_details_keyboard,
@@ -74,6 +80,9 @@ from keyboards.menu import (
     main_menu_keyboard,
     plans_list_keyboard,
     payment_retry_keyboard,
+    payment_provider_keyboard,
+    vc_payment_keyboard,
+    regenerate_payment_qr_keyboard,
 )
 from handlers.log_channel import (
     log_payment_started,
@@ -156,6 +165,138 @@ def _format_amount(amount: str | Decimal) -> str:
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     return text or "0"
+
+
+def _amounts_equal(left: str | Decimal | None, right: str | Decimal | None) -> bool:
+    try:
+        return Decimal(str(left)).quantize(Decimal("0.01")) == Decimal(str(right)).quantize(Decimal("0.01"))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+
+
+async def _enabled_payment_providers() -> list[str]:
+    values = await asyncio.gather(
+        get_setting("famapp_enabled", "1"),
+        get_setting("manual_payment_enabled", "1"),
+        get_setting("vc_gateway_enabled", "0"),
+    )
+    defaults = (True, True, False)
+    keys = ("famapp", "manual", "vc_gateway")
+    enabled = []
+    for key, value, default in zip(keys, values, defaults):
+        normalized = str(value).strip().lower()
+        is_enabled = default if normalized not in {"0", "1", "true", "false", "on", "off", "yes", "no"} else normalized in {"1", "true", "on", "yes"}
+        if is_enabled:
+            enabled.append(key)
+    return enabled
+
+
+def _order_provider(order: dict) -> str:
+    provider = order.get("payment_provider")
+    if provider:
+        return provider
+    return "famapp" if order.get("payment_purpose") else "manual"
+
+
+def _make_vc_order_id() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%y%m%d%H%M%S")
+    return f"VC{stamp}{secrets.token_hex(4).upper()}"
+
+
+def _build_vc_upi_uri(amount: str | Decimal, vc_order_id: str) -> str:
+    params = {
+        "pa": VC_GATEWAY_UPI_ID,
+        "pn": "Payee",
+        "am": _format_amount(amount),
+        "cu": "INR",
+        "tn": vc_order_id,
+    }
+    return "upi://pay?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+
+
+def _generate_vc_qr_bytes(amount: str | Decimal, vc_order_id: str) -> bytes:
+    qr = qrcode.QRCode(version=None, error_correction=ERROR_CORRECT_H, box_size=10, border=4)
+    qr.add_data(_build_vc_upi_uri(amount, vc_order_id))
+    qr.make(fit=True)
+    output = BytesIO()
+    qr.make_image(fill_color="black", back_color="white").save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
+def _find_response_value(payload, names: set[str]):
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if str(key).lower().replace("-", "_") in names:
+                return value
+        for value in payload.values():
+            found = _find_response_value(value, names)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = _find_response_value(value, names)
+            if found is not None:
+                return found
+    return None
+
+
+def _parse_vc_gateway_response(raw: str) -> dict | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        import json
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        upper = text.upper()
+        status = next((value for value in ("SUCCESS", "PENDING", "FAILED", "INVALID", "NOT_FOUND") if value in upper), None)
+        return {"status": status} if status else None
+    status = _find_response_value(payload, {"status", "payment_status", "paymentstatus"})
+    if status is None:
+        return None
+    return {
+        "status": str(status).upper(),
+        "order_id": _find_response_value(payload, {"order_id", "orderid", "transaction_order_id"}),
+        "amount": _find_response_value(payload, {"amount", "paid_amount", "paidamount", "transaction_amount"}),
+    }
+
+
+async def verify_vc_gateway_payment(order: dict) -> tuple[str, dict | None]:
+    """Query VC Gateway using only stored order values and validate its response."""
+    if not VC_GATEWAY_API_KEY:
+        logger.warning("VC API request rejected order_id=%s reason=missing_configuration", order.get("order_id"))
+        return "INVALID", None
+    logger.info("VC API request started order_id=%s vc_order_id=%s", order.get("order_id"), order.get("vc_order_id"))
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                VC_GATEWAY_API_URL,
+                params={
+                    "api_key": VC_GATEWAY_API_KEY,
+                    "order_id": order["vc_order_id"],
+                    "amount": _format_amount(order["expected_amount"]),
+                },
+            ) as response:
+                raw = await response.text()
+                if response.status < 200 or response.status >= 300:
+                    logger.warning("VC API response rejected order_id=%s http_status=%s", order.get("order_id"), response.status)
+                    return "INVALID", None
+    except Exception as exc:
+        logger.exception("VC API request failed order_id=%s exception_type=%s", order.get("order_id"), type(exc).__name__)
+        return "FAILED", None
+
+    parsed = _parse_vc_gateway_response(raw)
+    logger.info("VC response parsed order_id=%s status=%s", order.get("order_id"), (parsed or {}).get("status"))
+    if not parsed or parsed.get("status") not in {"SUCCESS", "PENDING", "FAILED", "INVALID", "NOT_FOUND"}:
+        return "INVALID", parsed
+    if parsed["status"] == "SUCCESS" and (
+        str(parsed.get("order_id")) != str(order.get("vc_order_id"))
+        or not _amounts_equal(parsed.get("amount"), order.get("expected_amount"))
+    ):
+        logger.warning("VC response rejected order_id=%s reason=provider_order_or_amount_mismatch", order.get("order_id"))
+        return "INVALID", parsed
+    return parsed["status"], parsed
 
 
 def _generate_famapp_purpose() -> str:
@@ -759,6 +900,7 @@ async def _send_payment_screen(
                 payee_name=DEFAULT_PAYEE_NAME,
                 qr_image=famapp_qr_bytes,
                 expires_at=famapp_expires_at,
+                payment_provider="famapp",
             )
             order_id = candidate
             logger.info("ORDER CREATED order_id=%s user_id=%s plan_id=%s expires_at=%s", order_id, user_id, plan_id, famapp_expires_at.isoformat())
@@ -1070,6 +1212,7 @@ async def _send_manual_payment_screen(
                 final_price=final_price_str,
                 referral_discount_used=discount_pct,
                 expires_at=manual_expires_at,
+                payment_provider="manual",
             )
             order_id = candidate
             break
@@ -1162,6 +1305,146 @@ async def _send_manual_payment_screen(
     return order_id
 
 
+async def create_vc_gateway_payment(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    plan: dict,
+    plan_id: int | None,
+    final_price_str: str,
+    price_section: str,
+    discount_pct: int,
+) -> str | None:
+    """Create and render a fresh VC Gateway payment order."""
+    if not VC_GATEWAY_UPI_ID:
+        await bot.send_message(chat_id, "⚠️ VC Gateway is not configured. Please contact support.")
+        return None
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=int(ORDER_EXPIRY_MINUTES or 10))
+    order_id = None
+    vc_order_id = None
+    qr_bytes = None
+    for _ in range(5):
+        candidate_order_id = _make_order_id()
+        candidate_vc_order_id = _make_vc_order_id()
+        candidate_qr = _generate_vc_qr_bytes(final_price_str, candidate_vc_order_id)
+        try:
+            await create_order(
+                user_id=user_id,
+                plan_name=plan["name"],
+                plan_price=plan["price"],
+                plan_validity=plan["validity"],
+                order_id=candidate_order_id,
+                plan_id=plan_id,
+                access_link=plan["access_link"],
+                final_price=final_price_str,
+                referral_discount_used=discount_pct,
+                qr_image=candidate_qr,
+                expires_at=expires_at,
+                payment_provider="vc_gateway",
+                vc_order_id=candidate_vc_order_id,
+            )
+            order_id, vc_order_id, qr_bytes = candidate_order_id, candidate_vc_order_id, candidate_qr
+            break
+        except Exception as exc:
+            if "UNIQUE" in str(exc).upper():
+                logger.warning("VC order ID collision; retrying")
+                continue
+            logger.exception("VC order creation failed user_id=%s", user_id)
+            await bot.send_message(chat_id, "⚠️ Could not create the VC Gateway payment. Please try again.")
+            return None
+    if not order_id or not vc_order_id or qr_bytes is None:
+        await bot.send_message(chat_id, "⚠️ Could not generate a VC Gateway order. Please try again.")
+        return None
+
+    await supersede_active_orders(user_id, plan_id, order_id)
+    logger.info("VC order created order_id=%s vc_order_id=%s user_id=%s plan_id=%s", order_id, vc_order_id, user_id, plan_id)
+    try:
+        qr_message = await bot.send_photo(
+            chat_id=chat_id,
+            photo=BufferedInputFile(qr_bytes, filename=f"{vc_order_id}.png"),
+        )
+        payment_text = (
+            "💳 <b>VC Gateway Payment</b>\n\n"
+            f"📦 <b>Plan:</b> {html.escape(plan['name'])}\n"
+            f"{price_section}\n"
+            f"⌛ <b>Validity:</b> {html.escape(str(plan['validity']))}\n\n"
+            "📲 Scan the QR code above and pay the exact amount.\n\n"
+            f"🆔 <b>VC Order ID:</b> <code>{vc_order_id}</code>\n"
+            "⏱️ <b>Expires in:</b> 10 minutes"
+        )
+        payment_message = await bot.send_message(
+            chat_id,
+            payment_text,
+            reply_markup=vc_payment_keyboard(order_id),
+        )
+    except Exception:
+        logger.exception("VC QR/message delivery failed order_id=%s", order_id)
+        await update_order_status(order_id, "failed")
+        raise
+    await update_order_messages(order_id, user_id, qr_message.message_id, payment_message.message_id)
+    _awaiting_proof[user_id] = {
+        "order_id": order_id,
+        "plan_id": plan_id,
+        "plan_name": plan["name"],
+        "plan_price": plan["price"],
+        "final_price": final_price_str,
+        "plan_validity": plan["validity"],
+        "access_link": plan["access_link"],
+        "price_section": price_section,
+        "discount_pct": discount_pct,
+        "qr_msg_id": qr_message.message_id,
+        "payment_msg_id": payment_message.message_id,
+        "provider": "vc_gateway",
+    }
+    await set_pending_reminder(
+        user_id=user_id,
+        order_id=order_id,
+        plan_id=plan_id,
+        plan_name=plan["name"],
+        plan_price=plan["price"],
+        plan_validity=plan["validity"],
+        first_due=datetime.now(timezone.utc) + timedelta(minutes=15),
+        second_due=datetime.now(timezone.utc) + timedelta(minutes=1440),
+    )
+    logger.info("VC QR generated order_id=%s vc_order_id=%s", order_id, vc_order_id)
+    return order_id
+
+
+# ── Payment provider selection ───────────────────────────────────────────────
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("choose_payment:"))
+async def callback_choose_payment(call: CallbackQuery, bot: Bot) -> None:
+    await call.answer()
+    try:
+        plan_id = int(call.data.split(":", 1)[1])
+    except (AttributeError, ValueError, IndexError):
+        await call.message.answer("⚠️ Invalid plan. Please try again.")
+        return
+    providers = await _enabled_payment_providers()
+    if not providers:
+        await call.message.edit_text("Currently no payment method is available.\nPlease contact support.")
+        return
+    if len(providers) == 1:
+        await callback_buy(call, bot, plan_id=plan_id, provider=providers[0])
+        return
+    await call.message.edit_text("💳 <b>Select a payment method</b>", reply_markup=payment_provider_keyboard(plan_id, providers))
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("payment_method:"))
+async def callback_payment_method(call: CallbackQuery, bot: Bot) -> None:
+    try:
+        _, plan_id_text, provider = call.data.split(":", 2)
+        plan_id = int(plan_id_text)
+    except (AttributeError, ValueError, IndexError):
+        await call.answer("⚠️ Invalid payment method.", show_alert=True)
+        return
+    if provider not in {"famapp", "manual", "vc_gateway"} or provider not in await _enabled_payment_providers():
+        await call.answer("⚠️ This payment method is currently unavailable.", show_alert=True)
+        return
+    await callback_buy(call, bot, plan_id=plan_id, provider=provider)
+
+
 # ── Buy Now (buy:{plan_id}) ───────────────────────────────────────────────────
 
 
@@ -1189,6 +1472,15 @@ async def callback_regenerate_payment_qr(call: CallbackQuery, bot: Bot) -> None:
         await call.message.edit_reply_markup(reply_markup=None)
         return
 
+    if _order_provider(order) == "vc_gateway":
+        await callback_buy(call, bot, plan_id=plan_id, provider="vc_gateway")
+        if _awaiting_proof.get(call.from_user.id, {}).get("order_id") != order_id:
+            try:
+                await call.message.delete()
+            except Exception:
+                pass
+        return
+
     # Reuse callback_buy so regeneration gets the same lock, temporary status,
     # plan checks, payment mode, pricing, QR creation, and cleanup behavior.
     try:
@@ -1204,7 +1496,7 @@ async def callback_regenerate_payment_qr(call: CallbackQuery, bot: Bot) -> None:
             await call.message.edit_reply_markup(reply_markup=None)
         except Exception:
             logger.exception("Could not remove expired-payment button order_id=%s", order_id)
-    await callback_buy(call, bot, plan_id=plan_id)
+    await callback_buy(call, bot, plan_id=plan_id, provider=_order_provider(order))
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("buy:"))
@@ -1212,6 +1504,7 @@ async def callback_buy(
     call: CallbackQuery,
     bot: Bot,
     plan_id: int | None = None,
+    provider: str | None = None,
 ) -> None:
     """User tapped Buy Now — load plan from DB, generate order, show payment details."""
     logger.info("BUY CALLBACK HIT callback_data=%s", call.data)
@@ -1294,12 +1587,29 @@ async def callback_buy(
             f"💳 <b>Final Price:</b> ₹{final_price_str}"
         )
 
-        # Every Buy Now click creates a completely fresh order and QR.
-        # We intentionally do not restore or reuse a prior pending order.
-        payment_mode = (await get_setting("payment_mode", "automatic")) or "automatic"
+        # Direct legacy buy callbacks continue to use the old setting; the
+        # normal plan screen supplies an explicit provider choice.
+        selected_provider = provider
+        if selected_provider is None:
+            payment_mode = (await get_setting("payment_mode", "automatic")) or "automatic"
+            selected_provider = "manual" if payment_mode == "manual" else "famapp"
+        if selected_provider not in await _enabled_payment_providers():
+            await call.message.answer("Currently no payment method is available.\nPlease contact support.")
+            return
 
-        if payment_mode == "manual":
+        if selected_provider == "manual":
             new_order_id = await _send_manual_payment_screen(
+                bot=bot,
+                chat_id=call.message.chat.id,
+                user_id=user.id,
+                plan=plan,
+                plan_id=plan_id,
+                final_price_str=final_price_str,
+                price_section=price_section,
+                discount_pct=discount_pct,
+            )
+        elif selected_provider == "vc_gateway":
+            new_order_id = await create_vc_gateway_payment(
                 bot=bot,
                 chat_id=call.message.chat.id,
                 user_id=user.id,
@@ -1351,6 +1661,105 @@ async def callback_buy(
         if _payment_generation_locks.get(lock_key) is flow_lock:
             _payment_generation_locks.pop(lock_key, None)
 
+
+async def approve_vc_gateway_order(order: dict, user_id: int, provider_summary: dict | None) -> dict | None:
+    """Atomically approve a verified VC order and activate its subscription once."""
+    return await approve_order(
+        order["order_id"],
+        expected_user_id=user_id,
+        expected_payment_provider="vc_gateway",
+        expected_vc_order_id=order.get("vc_order_id"),
+        expected_amount=str(order.get("expected_amount")),
+        allow_created=True,
+    )
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("vc_check:"))
+async def callback_vc_check(call: CallbackQuery, bot: Bot) -> None:
+    await call.answer()
+    order_id = call.data.split(":", 1)[1]
+    user = call.from_user
+    lock_key = (user.id, order_id)
+    status_lock = _payment_status_locks.setdefault(lock_key, asyncio.Lock())
+    await status_lock.acquire()
+    try:
+        order = await get_order(order_id)
+        if not order or order.get("user_id") != user.id or _order_provider(order) != "vc_gateway":
+            await call.message.edit_reply_markup(reply_markup=None)
+            await call.answer("⚠️ This payment request is not available.", show_alert=True)
+            return
+        info = _awaiting_proof.setdefault(user.id, {
+            "order_id": order_id,
+            "plan_id": order.get("plan_id"),
+            "plan_name": order.get("plan_name", ""),
+            "plan_price": order.get("plan_price", ""),
+            "final_price": order.get("expected_amount", ""),
+            "plan_validity": order.get("plan_validity", ""),
+            "access_link": order.get("access_link", ""),
+            "status_message_id": order.get("status_message_id"),
+        })
+        status = order.get("payment_status")
+        if status in {"approved", "superseded", "cancelled", "rejected", "failed"}:
+            await _edit_or_create_status_message(call, bot, user.id, order_id, info, "⚠️ This payment request is no longer available.")
+            return
+        expires_at = order.get("expires_at")
+        if expires_at:
+            try:
+                expiry = expires_at if isinstance(expires_at, datetime) else datetime.fromisoformat(str(expires_at))
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) >= expiry:
+                    await update_order_status(order_id, "expired")
+                    await _edit_or_create_status_message(call, bot, user.id, order_id, info, "⏰ <b>Payment QR Expired</b>\n\nYour payment session has expired.\nPlease generate a new QR to continue your purchase.", regenerate_payment_qr_keyboard(order_id))
+                    return
+            except (TypeError, ValueError):
+                await _edit_or_create_status_message(call, bot, user.id, order_id, info, "⚠️ Payment order data is invalid. Please contact support.")
+                return
+
+        await _edit_or_create_status_message(call, bot, user.id, order_id, info, "⏳ <b>Checking your VC Gateway payment...</b>\n\nPlease wait a moment.")
+        provider_status, summary = await verify_vc_gateway_payment(order)
+        if summary:
+            await save_provider_response_summary(order_id, user.id, {
+                "status": summary.get("status"),
+                "order_id": summary.get("order_id"),
+                "amount": summary.get("amount"),
+            })
+        if provider_status == "SUCCESS":
+            result = await approve_vc_gateway_order(order, user.id, summary)
+            if result:
+                expiry_str = result["subscription_end"].astimezone(_IST).strftime("%d %b %Y")
+                activation_text = (
+                    "🎉 <b>Payment Verified! Plan Activated!</b>\n\n"
+                    f"📦 <b>Plan:</b> {html.escape(result['plan_name'])}\n"
+                    f"⏳ <b>Validity:</b> {html.escape(result['plan_validity'])}\n"
+                    f"📅 <b>Expires:</b> {expiry_str}\n\n"
+                )
+                if result.get("access_link"):
+                    activation_text += f"🔗 <b>Access Link:</b>\n{result['access_link']}\n\n"
+                activation_text += "Thank you for your purchase! ❤️"
+                await log_payment_success(
+                    bot, user.id, user.first_name, result["plan_name"],
+                    order["expected_amount"], order_id, getattr(user, "username", None),
+                    payment_provider="vc_gateway", provider_order_id=order.get("vc_order_id"),
+                )
+                await _edit_or_create_status_message(call, bot, user.id, order_id, info, activation_text, main_menu_keyboard())
+            else:
+                logger.info("VC duplicate callback ignored order_id=%s user_id=%s", order_id, user.id)
+                await _edit_or_create_status_message(call, bot, user.id, order_id, info, "✅ <b>Your plan is already activated.</b>\n\nUse /status to check your subscription.", main_menu_keyboard())
+            return
+        messages = {
+            "PENDING": "⏳ Payment not received yet. Please wait a moment and try again.\n\n💡 If you have already paid, please contact support.",
+            "FAILED": "❌ VC Gateway reports that this payment failed. Please generate a new QR and try again.",
+            "INVALID": "⚠️ VC Gateway returned an invalid payment response. Please contact support if you have already paid.",
+            "NOT_FOUND": "⚠️ VC Gateway could not find this payment yet. Please wait a moment and try again.",
+        }
+        await _edit_or_create_status_message(call, bot, user.id, order_id, info, messages.get(provider_status, messages["INVALID"]), vc_payment_keyboard(order_id))
+        logger.info("VC payment %s order_id=%s", provider_status.lower(), order_id)
+    finally:
+        status_lock.release()
+        if _payment_status_locks.get(lock_key) is status_lock:
+            _payment_status_locks.pop(lock_key, None)
+
 # ── I Have Paid → automatic FamApp verification ──────────────────────────────
 
 
@@ -1385,6 +1794,10 @@ async def callback_i_have_paid(call: CallbackQuery, bot: Bot) -> None:
     final_price = (
         info.get("final_price") or await get_order_final_price(order_id) or "0"
     )
+    provider_order = await get_order(order_id)
+    if not provider_order or provider_order.get("user_id") != user.id or _order_provider(provider_order) != "famapp":
+        await call.answer("⚠️ This payment request is not available.", show_alert=True)
+        return
 
     lock_key = (user.id, order_id)
     status_lock = _payment_status_locks.setdefault(lock_key, asyncio.Lock())
@@ -1596,6 +2009,10 @@ async def callback_i_have_paid(call: CallbackQuery, bot: Bot) -> None:
 async def callback_cancel_order(call: CallbackQuery, bot: Bot) -> None:
     await call.answer()
     order_id = call.data.split(":", 1)[1]
+    order = await get_order(order_id)
+    if not order or order.get("user_id") != call.from_user.id:
+        await call.answer("⚠️ This payment request is not available.", show_alert=True)
+        return
     cancelled = await update_order_status(order_id, "cancelled")
     if cancelled:
         await log_payment_cancelled(
@@ -1652,7 +2069,11 @@ async def handle_proof_photo(message: Message, bot: Bot) -> None:
         logger.warning("Manual proof rejected user_id=%s order_id=%s reason=order_not_found", user.id, order_id)
         await message.answer("⚠️ Order not found. Please contact support.")
         return
-    if order.get("user_id") != user.id or order.get("payment_status") == "expired":
+    if (
+        order.get("user_id") != user.id
+        or _order_provider(order) != "manual"
+        or order.get("payment_status") in {"expired", "cancelled", "superseded", "approved", "rejected"}
+    ):
         logger.warning(
             "Manual proof rejected user_id=%s order_id=%s reason=ownership_or_expiry order_user_id=%s status=%s",
             user.id,
@@ -1729,6 +2150,11 @@ async def callback_manual_approve(call: CallbackQuery, bot: Bot) -> None:
         user_id = int(user_id_str)
     except (ValueError, IndexError):
         await call.answer("⚠️ Invalid callback data.", show_alert=True)
+        return
+
+    order = await get_order(order_id)
+    if not order or order.get("user_id") != user_id or _order_provider(order) != "manual":
+        await call.answer("⚠️ Invalid manual payment order.", show_alert=True)
         return
 
     # approve_order requires pending status (already set when screenshot was received)
@@ -1821,6 +2247,10 @@ async def callback_manual_reject(call: CallbackQuery, bot: Bot) -> None:
         await call.answer("⚠️ Invalid callback data.", show_alert=True)
         return
 
+    order = await get_order(order_id)
+    if not order or order.get("user_id") != user_id or _order_provider(order) != "manual" or order.get("payment_status") != "pending":
+        await call.answer("⚠️ Order already processed or invalid.", show_alert=True)
+        return
     await update_order_status(order_id, "rejected")
     await cancel_reminder(user_id, order_id)
 

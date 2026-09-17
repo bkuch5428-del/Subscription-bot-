@@ -96,7 +96,14 @@ async def log_payment_success(
     amount: str = "",
     order_id: str = "",
     username: str | None = None,
+    payment_provider: str | None = None,
+    provider_order_id: str | None = None,
 ) -> None:
+    provider_lines = ""
+    if payment_provider:
+        provider_lines += f"\n💳 Provider: {html.escape(payment_provider)}"
+    if provider_order_id:
+        provider_lines += f"\n🆔 Provider Order: <code>{html.escape(provider_order_id)}</code>"
     await _send(
         bot,
         "🎉 <b>Payment Successful</b>\n\n"
@@ -105,6 +112,7 @@ async def log_payment_success(
         f"📦 Plan: {html.escape(plan_name)}\n"
         f"💰 Amount: ₹{html.escape(amount)}\n"
         f"🆔 Order: <code>{html.escape(order_id)}</code>\n\n"
+        f"{provider_lines}\n"
         "✅ Subscription Activated\n\n"
         f"{_contact_line(user_id, username)}",
     )

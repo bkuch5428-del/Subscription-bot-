@@ -41,6 +41,7 @@ from database import (
     claim_demo_expiry,
     complete_demo_deletion,
     expire_due_orders,
+    claim_expiry_notification,
     get_user_info,
     cancel_reminder,
 )
@@ -110,6 +111,8 @@ async def _tick(bot: Bot) -> None:
     # Expire payment orders independently of reminder settings. The database
     # update is atomic, so an approval racing this sweep cannot win afterward.
     for order in await expire_due_orders():
+        if not await claim_expiry_notification(order["_id"]):
+            continue
         await cancel_reminder(order["user_id"], order["_id"])
         user = await get_user_info(order["user_id"])
         await log_payment_expired(

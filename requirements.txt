@@ -6,3 +6,4 @@ pymongo
 qrcode[pil]
 Pillow
 zxing-cpp
+aiohttp

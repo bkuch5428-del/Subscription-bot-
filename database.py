@@ -24,6 +24,7 @@ from datetime import datetime, timezone, timedelta
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import UpdateOne
+from config import VC_GATEWAY_ENABLED
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,8 @@ async def init_db() -> None:
     await _orders.create_index("payment_status")
     await _orders.create_index("user_id")
     await _orders.create_index("subscription_end")
+    await _orders.create_index("payment_provider")
+    await _orders.create_index("vc_order_id", sparse=True, unique=True)
     await _reminders.create_index("first_due")
     await _reminders.create_index("second_due")
     await _demo_sessions.create_index([("status", 1), ("expires_at", 1)])
@@ -177,6 +180,9 @@ async def init_db() -> None:
         ("max_referral_discount",    "100"), # maximum total discount a user can earn
         ("max_referrals",            "0"),   # max referrals per referrer (0 = unlimited)
         ("payment_mode",             "automatic"),  # "automatic" or "manual"
+        ("famapp_enabled",           "1"),
+        ("manual_payment_enabled",    "1"),
+        ("vc_gateway_enabled",        "1" if VC_GATEWAY_ENABLED else "0"),
         ("manual_payment_qr",        ""),    # QR image URL for manual payment mode
         ("manual_upi_text",          ""),    # UPI ID / text shown in manual payment mode
         ("maintenance_mode",         False), # normal-user access gate
@@ -863,6 +869,8 @@ async def create_order(
     payee_name: str | None = None,
     qr_image: bytes | None = None,
     expires_at: datetime | None = None,
+    payment_provider: str = "famapp",
+    vc_order_id: str | None = None,
 ) -> None:
     """Insert a new order row with status 'created'.
 
@@ -874,7 +882,7 @@ async def create_order(
     creating a payment order; existing manual/payment logic remains unchanged.
     """
     try:
-        await _orders.insert_one({
+        order_doc = {
             "_id":                    order_id,
             "user_id":                user_id,
             "plan_name":              plan_name,
@@ -882,6 +890,8 @@ async def create_order(
             "final_price":            final_price or plan_price,
             "plan_validity":          plan_validity,
             "payment_status":         "created",
+            "payment_provider":       payment_provider,
+            "expected_amount":        final_price or plan_price,
             "created_at":             datetime.now(timezone.utc),
             "subscription_start":     None,
             "subscription_end":       None,
@@ -893,7 +903,11 @@ async def create_order(
             "payee_name":            payee_name,
             "qr_image":              qr_image,
             "expires_at":            expires_at,
-        })
+            "expiry_notified":       False,
+        }
+        if vc_order_id:
+            order_doc["vc_order_id"] = vc_order_id
+        await _orders.insert_one(order_doc)
     except Exception as exc:
         # Preserve the SQLite-era "UNIQUE" signal so callers retrying on
         # order_id collisions (see handlers/payment.py) keep working.
@@ -901,6 +915,29 @@ async def create_order(
             raise Exception(f"UNIQUE constraint failed: orders.order_id ({exc})")
         raise
     logger.debug("Created order %s for user %s", order_id, user_id)
+
+
+async def supersede_active_orders(user_id: int, plan_id: int | None, new_order_id: str) -> int:
+    """Invalidate older live orders for this user's exact plan."""
+    result = await _orders.update_many(
+        {
+            "user_id": user_id,
+            "plan_id": plan_id,
+            "_id": {"$ne": new_order_id},
+            "payment_status": {"$in": ["created", "pending"]},
+        },
+        {"$set": {
+            "payment_status": "superseded",
+            "superseded_by": new_order_id,
+            "cancelled_at": datetime.now(timezone.utc),
+        }},
+    )
+    if result.modified_count:
+        logger.info(
+            "VC orders superseded user_id=%s plan_id=%s new_order_id=%s count=%s",
+            user_id, plan_id, new_order_id, result.modified_count,
+        )
+    return result.modified_count
 
 
 async def update_order_status(order_id: str, status: str) -> bool:
@@ -923,7 +960,7 @@ async def update_order_status(order_id: str, status: str) -> bool:
         if expires_at and datetime.now(timezone.utc) >= expires_at:
             await _orders.update_one(
                 {"_id": order_id, "payment_status": {"$in": ["created", "pending"]}},
-                {"$set": {"payment_status": "expired"}},
+                {"$set": {"payment_status": "expired", "expiry_notified": False}},
             )
             logger.warning(
                 "Order %s rejected pending transition: expired_at=%s status=%s",
@@ -964,11 +1001,20 @@ async def expire_due_orders(now: datetime | None = None) -> list[dict]:
     for doc in due:
         result = await _orders.update_one(
             {"_id": doc["_id"], "payment_status": {"$in": ["created", "pending"]}},
-            {"$set": {"payment_status": "expired"}},
+            {"$set": {"payment_status": "expired", "expiry_notified": False}},
         )
         if result.modified_count:
             expired.append(doc)
     return expired
+
+
+async def claim_expiry_notification(order_id: str) -> bool:
+    """Claim an expiry notice exactly once."""
+    result = await _orders.update_one(
+        {"_id": order_id, "payment_status": "expired", "expiry_notified": {"$ne": True}},
+        {"$set": {"expiry_notified": True}},
+    )
+    return result.modified_count == 1
 
 
 async def update_order_messages(
@@ -994,6 +1040,14 @@ async def update_order_status_message(
     await _orders.update_one(
         {"_id": order_id, "user_id": user_id},
         {"$set": {"status_message_id": status_message_id}},
+    )
+
+
+async def save_provider_response_summary(order_id: str, user_id: int, summary: dict) -> None:
+    """Persist non-sensitive provider response fields for auditability."""
+    await _orders.update_one(
+        {"_id": order_id, "user_id": user_id},
+        {"$set": {"provider_response_summary": summary}},
     )
 
 
@@ -1033,7 +1087,14 @@ async def get_active_order_for_user_plan(user_id: int, plan_id: int | None) -> d
     )
 
 
-async def approve_order(order_id: str, expected_user_id: int | None = None) -> dict | None:
+async def approve_order(
+    order_id: str,
+    expected_user_id: int | None = None,
+    expected_payment_provider: str | None = None,
+    expected_vc_order_id: str | None = None,
+    expected_amount: str | None = None,
+    allow_created: bool = False,
+) -> dict | None:
     """
     Approve an order:
       - payment_status   → 'approved'
@@ -1049,11 +1110,17 @@ async def approve_order(order_id: str, expected_user_id: int | None = None) -> d
     now = datetime.now(timezone.utc)
     query = {
         "_id": order_id,
-        "payment_status": "pending",
+        "payment_status": {"$in": ["created", "pending"]} if allow_created else "pending",
         "$or": [{"expires_at": None}, {"expires_at": {"$exists": False}}, {"expires_at": {"$gt": now}}],
     }
     if expected_user_id is not None:
         query["user_id"] = expected_user_id
+    if expected_payment_provider is not None:
+        query["payment_provider"] = expected_payment_provider
+    if expected_vc_order_id is not None:
+        query["vc_order_id"] = expected_vc_order_id
+    if expected_amount is not None:
+        query["expected_amount"] = expected_amount
     peek = await _orders.find_one(query)
     if not peek:
         return None
@@ -1136,10 +1203,17 @@ async def get_order(order_id: str) -> dict | None:
         "plan_id":       doc.get("plan_id"),
         "access_link":   doc.get("access_link", ""),
         "payment_status": doc.get("payment_status", ""),
+        "payment_provider": doc.get("payment_provider"),
+        "vc_order_id":     doc.get("vc_order_id"),
+        "expected_amount": doc.get("expected_amount") or doc.get("final_price") or doc.get("plan_price", ""),
+        "qr_image":        doc.get("qr_image"),
+        "qr_message_id":   doc.get("qr_message_id"),
+        "payment_message_id": doc.get("payment_message_id"),
         "payment_purpose": doc.get("payment_purpose"),
         "upi_uri":         doc.get("upi_uri"),
         "expires_at":       doc.get("expires_at"),
         "status_message_id": doc.get("status_message_id"),
+        "superseded_by": doc.get("superseded_by"),
     }
 
 
