@@ -391,7 +391,7 @@ def referral_settings_keyboard(enabled: bool) -> InlineKeyboardMarkup:
     )
 
 
-def payment_settings_keyboard(mode: str) -> InlineKeyboardMarkup:
+def payment_settings_keyboard(active_provider: str) -> InlineKeyboardMarkup:
     """Sub-panel for payment configuration and active provider selection."""
     return InlineKeyboardMarkup(
         inline_keyboard=[

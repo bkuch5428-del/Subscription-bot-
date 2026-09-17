@@ -2063,7 +2063,7 @@ async def _payment_settings_panel(target) -> None:
         f"Manual UPI text: {'✅ set' if upi_val else '⬜ not set'}\n\n"
         "Select an option:"
     )
-    kb = payment_settings_keyboard(mode)
+    kb = payment_settings_keyboard(active_provider)
     if isinstance(target, CallbackQuery):
         try:
             await target.message.edit_text(text, reply_markup=kb)
