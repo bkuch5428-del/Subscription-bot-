@@ -35,6 +35,7 @@ from database import (
     update_plan,
     delete_plan,
     get_stats,
+    get_payment_stats_last_24h,
     get_pending_orders,
     get_all_user_ids,
     get_user_info,
@@ -78,6 +79,7 @@ router = Router()
 # ── State storage ─────────────────────────────────────────────────────────────
 # { user_id: { "step": str, "data": dict } }
 _state: dict[int, dict] = {}
+_payment_stats_refresh_tasks: dict[int, asyncio.Task] = {}
 
 _STEPS_LABEL = {
     "add:name":     "📝 Enter the plan name:",
@@ -131,8 +133,65 @@ def _in_any_admin_state(message: Message) -> bool:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _cancel_payment_stats_refresh(user_id: int) -> None:
+    task = _payment_stats_refresh_tasks.pop(user_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+async def _render_payment_stats_message(message, admin_id: int) -> None:
+    def money_fmt(value: float | int) -> str:
+        numeric = float(value)
+        if numeric.is_integer():
+            return f"₹{int(numeric):,}"
+        return f"₹{numeric:,.2f}"
+
+    try:
+        stats = await get_payment_stats_last_24h()
+    except Exception:
+        logger.exception("Admin payment stats 24h query failed for user_id=%s", admin_id)
+        await message.edit_text(
+            "⚠️ Failed to load payment stats. Please try again.",
+            reply_markup=admin_panel_keyboard(),
+        )
+        return
+
+    providers = stats["providers"]
+    famapp = providers["famapp"]
+    manual = providers["manual"]
+    vc = providers["vc_gateway"]
+    total_payments = stats["total_payments"]
+    total_amount = stats["total_amount"]
+
+    text = (
+        "📊 <b>PAYMENT STATS — LAST 24 HOURS</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🟢 <b>FamApp</b>\n"
+        f"   Payments: {famapp['payments']}\n"
+        f"   Amount: {money_fmt(famapp['amount'])}\n\n"
+        "💵 <b>Manual</b>\n"
+        f"   Payments: {manual['payments']}\n"
+        f"   Amount: {money_fmt(manual['amount'])}\n\n"
+        "🔵 <b>VC Gateway</b>\n"
+        f"   Payments: {vc['payments']}\n"
+        f"   Amount: {money_fmt(vc['amount'])}\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"💳 <b>Total:</b> {total_payments} payments\n"
+        f"💰 <b>Revenue:</b> {money_fmt(total_amount)}\n\n"
+        "🕐 <b>Period:</b> Last 24 Hours\n"
+        "🔄 <b>Updated:</b> Just now"
+    )
+
+    await message.edit_text(text, reply_markup=admin_panel_keyboard())
+
+
 async def _go_panel(target, bot: Bot | None = None) -> None:
     """Send or edit-to the main admin panel."""
+    if isinstance(target, CallbackQuery):
+        _cancel_payment_stats_refresh(target.from_user.id)
+    elif hasattr(target, "from_user") and target.from_user is not None:
+        _cancel_payment_stats_refresh(target.from_user.id)
+
     text = "🛠 <b>ADMIN PANEL</b>\n\nSelect an option:"
     kb = admin_panel_keyboard()
     if isinstance(target, CallbackQuery):
@@ -220,6 +279,33 @@ async def cb_stats(call: CallbackQuery) -> None:
         "━━━━━━━━━━━━━━━━━━━━━",
         reply_markup=admin_panel_keyboard(),
     )
+
+
+@router.callback_query(lambda c: c.data == "admin_payment_stats_24h")
+async def cb_payment_stats_24h(call: CallbackQuery) -> None:
+    if not _is_admin(call.from_user.id):
+        await call.answer("⛔ Unauthorised.", show_alert=True)
+        return
+    await call.answer()
+
+    _cancel_payment_stats_refresh(call.from_user.id)
+    await _render_payment_stats_message(call.message, call.from_user.id)
+
+    async def _refresh_loop() -> None:
+        try:
+            while True:
+                await asyncio.sleep(15)
+                if not _is_admin(call.from_user.id):
+                    return
+                try:
+                    await _render_payment_stats_message(call.message, call.from_user.id)
+                except Exception:
+                    logger.exception("Failed to auto-refresh admin payment stats user_id=%s", call.from_user.id)
+        except asyncio.CancelledError:
+            pass
+
+    task = asyncio.create_task(_refresh_loop())
+    _payment_stats_refresh_tasks[call.from_user.id] = task
 
 
 async def _show_maintenance_panel(call: CallbackQuery) -> None:

@@ -51,7 +51,10 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="📊 Statistics", callback_data="admin_stats"),
-                InlineKeyboardButton(text="📢 Broadcast",  callback_data="admin_broadcast"),
+                InlineKeyboardButton(text="� Payment Stats — Last 24H", callback_data="admin_payment_stats_24h"),
+            ],
+            [
+                InlineKeyboardButton(text="�📢 Broadcast",  callback_data="admin_broadcast"),
             ],
             [
                 InlineKeyboardButton(text="👥 Users Info", callback_data="admin_users"),

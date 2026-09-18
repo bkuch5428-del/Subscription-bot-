@@ -1499,3 +1499,63 @@ async def get_stats() -> dict:
         "rejected_orders":  rejected_orders,
         "total_revenue":    total_revenue,
     }
+
+
+async def get_payment_stats_last_24h() -> dict:
+    """Return provider totals for approved payments in the last rolling 24 hours."""
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(hours=24)
+    start_iso = window_start.isoformat()
+    end_iso = now.isoformat()
+
+    pipeline = [
+        {
+            "$match": {
+                "payment_status": "approved",
+                "subscription_start": {"$gte": start_iso, "$lte": end_iso},
+                "payment_provider": {"$in": ["famapp", "manual", "vc_gateway"]},
+            }
+        },
+        {
+            "$project": {
+                "provider": "$payment_provider",
+                "amount": {"$ifNull": ["$final_price", "$plan_price"]},
+            }
+        },
+        {
+            "$group": {
+                "_id": "$provider",
+                "payments": {"$sum": 1},
+                "amount": {
+                    "$sum": {
+                        "$convert": {
+                            "input": "$amount",
+                            "to": "double",
+                            "onError": 0,
+                            "onNull": 0,
+                        }
+                    }
+                },
+            }
+        },
+    ]
+
+    providers = {key: {"payments": 0, "amount": 0.0} for key in ("famapp", "manual", "vc_gateway")}
+    async for doc in _orders.aggregate(pipeline):
+        provider = doc.get("_id")
+        if provider not in providers:
+            continue
+        providers[provider] = {
+            "payments": int(doc.get("payments", 0) or 0),
+            "amount": float(doc.get("amount", 0.0) or 0.0),
+        }
+
+    total_payments = sum(item["payments"] for item in providers.values())
+    total_amount = sum(item["amount"] for item in providers.values())
+    return {
+        "providers": providers,
+        "total_payments": total_payments,
+        "total_amount": total_amount,
+        "window_start": start_iso,
+        "window_end": end_iso,
+    }
