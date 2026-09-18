@@ -10,6 +10,7 @@ os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017")
 
 import database as db  # noqa: E402
 import handlers.admin as admin  # noqa: E402
+from aiogram.exceptions import TelegramBadRequest  # noqa: E402
 
 
 class FakeAggregate:
@@ -163,6 +164,79 @@ class AdminPaymentSettingsTests(unittest.TestCase):
             asyncio.run(admin.cb_payment_stats_24h(call))
         stats.assert_not_awaited()
         call.answer.assert_awaited_once_with("⛔ Unauthorised.", show_alert=True)
+
+    def test_payment_stats_repeated_render_skips_unchanged_message(self):
+        stats = {
+            "providers": {
+                "famapp": {"payments": 1, "amount": 99.0},
+                "manual": {"payments": 0, "amount": 0.0},
+                "vc_gateway": {"payments": 0, "amount": 0.0},
+            },
+            "total_payments": 1,
+            "total_amount": 99.0,
+        }
+        keyboard = admin.admin_panel_keyboard()
+        message = SimpleNamespace(text=None, reply_markup=None, edit_text=AsyncMock())
+        with patch.object(admin, "get_payment_stats_last_24h", new=AsyncMock(return_value=stats)):
+            asyncio.run(admin._render_payment_stats_message(message, 1))
+        message.text = message.edit_text.await_args.args[0]
+        message.reply_markup = keyboard
+        message.edit_text.reset_mock()
+
+        with (
+            patch.object(admin, "get_payment_stats_last_24h", new=AsyncMock(return_value=stats)),
+            patch.object(admin, "admin_panel_keyboard", return_value=keyboard),
+        ):
+            asyncio.run(admin._render_payment_stats_message(message, 1))
+        message.edit_text.assert_not_awaited()
+
+    def test_payment_stats_callback_edits_panel_message_and_answers(self):
+        stats = {
+            "providers": {
+                "famapp": {"payments": 2, "amount": 198.0},
+                "manual": {"payments": 0, "amount": 0.0},
+                "vc_gateway": {"payments": 0, "amount": 0.0},
+            },
+            "total_payments": 2,
+            "total_amount": 198.0,
+        }
+        call = SimpleNamespace(
+            from_user=SimpleNamespace(id=1),
+            message=SimpleNamespace(text="🛠 <b>ADMIN PANEL</b>", reply_markup=None, edit_text=AsyncMock()),
+            answer=AsyncMock(),
+        )
+
+        def discard_refresh_coroutine(coroutine):
+            coroutine.close()
+            return SimpleNamespace(done=lambda: True)
+
+        with (
+            patch.object(admin, "_is_admin", return_value=True),
+            patch.object(admin, "get_payment_stats_last_24h", new=AsyncMock(return_value=stats)),
+            patch.object(admin.asyncio, "create_task", side_effect=discard_refresh_coroutine),
+        ):
+            asyncio.run(admin.cb_payment_stats_24h(call))
+        call.answer.assert_awaited_once_with()
+        call.message.edit_text.assert_awaited_once()
+        self.assertIn("PAYMENT STATS — LAST 24 HOURS", call.message.edit_text.await_args.args[0])
+
+    def test_payment_stats_ignores_message_not_modified_error(self):
+        message = SimpleNamespace(
+            text=None,
+            reply_markup=None,
+            edit_text=AsyncMock(side_effect=TelegramBadRequest(method="editMessageText", message="Bad Request: message is not modified")),
+        )
+        stats = {
+            "providers": {
+                "famapp": {"payments": 0, "amount": 0.0},
+                "manual": {"payments": 0, "amount": 0.0},
+                "vc_gateway": {"payments": 0, "amount": 0.0},
+            },
+            "total_payments": 0,
+            "total_amount": 0.0,
+        }
+        with patch.object(admin, "get_payment_stats_last_24h", new=AsyncMock(return_value=stats)):
+            asyncio.run(admin._render_payment_stats_message(message, 1))
 
 
 if __name__ == "__main__":

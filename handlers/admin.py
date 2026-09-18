@@ -182,7 +182,17 @@ async def _render_payment_stats_message(message, admin_id: int) -> None:
         "🔄 <b>Updated:</b> Just now"
     )
 
-    await message.edit_text(text, reply_markup=admin_panel_keyboard())
+    keyboard = admin_panel_keyboard()
+    current_text = getattr(message, "text", None)
+    current_keyboard = getattr(message, "reply_markup", None)
+    if current_text == text and current_keyboard == keyboard:
+        return
+
+    try:
+        await message.edit_text(text, reply_markup=keyboard)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
 
 
 async def _go_panel(target, bot: Bot | None = None) -> None:
