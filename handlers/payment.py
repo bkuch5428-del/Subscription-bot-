@@ -61,7 +61,7 @@ from database import (
     get_order_final_price,
     user_has_active_plan,
     get_plan,
-    get_all_plans,
+    get_visible_plans,
     get_setting,
     get_user_referral_info,
     set_pending_reminder,
@@ -1631,6 +1631,9 @@ async def callback_buy(
             await call.message.answer("⚠️ Plan not found. It may have been removed.")
             logger.info("BUY CALLBACK RETURN: plan not found user_id=%s plan_id=%s", user.id, plan_id)
             return
+        if plan.get("is_hidden", False) is True:
+            await call.message.answer("⚠️ This plan is currently unavailable.")
+            return
         logger.info("PLAN RESOLVED user_id=%s plan_id=%s plan_name=%s", user.id, plan_id, plan["name"])
 
         await cancel_start_reminders(user.id)
@@ -2227,7 +2230,7 @@ async def callback_cancel_order(call: CallbackQuery, bot: Bot) -> None:
     _awaiting_proof.pop(call.from_user.id, None)
     await cancel_reminder(call.from_user.id, order_id)
 
-    plans = await get_all_plans()
+    plans = await get_visible_plans()
     await call.message.answer(
         _PRODUCT_TEXT.format(first_name=call.from_user.first_name),
         reply_markup=plans_list_keyboard(plans) if plans else main_menu_keyboard(),

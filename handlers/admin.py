@@ -33,6 +33,7 @@ from database import (
     get_all_plans,
     get_plan,
     update_plan,
+    toggle_plan_visibility,
     delete_plan,
     get_stats,
     get_payment_stats_last_24h,
@@ -965,7 +966,31 @@ async def cb_edit_plan_selected(call: CallbackQuery) -> None:
     _state[call.from_user.id] = {"step": "edit:field", "data": {"plan_id": plan_id}}
     await call.message.edit_text(
         f"✏️ <b>Edit Plan:</b> {plan['name']}\n\nSelect a field to edit:",
-        reply_markup=admin_edit_fields_keyboard(plan_id),
+        reply_markup=admin_edit_fields_keyboard(plan_id, plan.get("is_hidden", False)),
+    )
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("admin_toggle_plan_visibility:"))
+async def cb_toggle_plan_visibility(call: CallbackQuery) -> None:
+    if not _is_admin(call.from_user.id):
+        await call.answer("⛔ Unauthorised.", show_alert=True)
+        return
+    try:
+        plan_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("⚠️ Invalid request.", show_alert=True)
+        return
+
+    plan = await toggle_plan_visibility(plan_id)
+    if not plan:
+        await call.answer("Plan not found.", show_alert=True)
+        return
+
+    _state[call.from_user.id] = {"step": "edit:field", "data": {"plan_id": plan_id}}
+    await call.answer("✅ Plan visibility updated.")
+    await call.message.edit_text(
+        f"✏️ <b>Edit Plan:</b> {plan['name']}\n\nSelect a field to edit:",
+        reply_markup=admin_edit_fields_keyboard(plan_id, plan.get("is_hidden", False)),
     )
 
 
@@ -1007,7 +1032,7 @@ async def cb_move_plan(call: CallbackQuery) -> None:
     try:
         await call.message.edit_text(
             f"✏️ <b>Edit Plan:</b> {plan['name']}\n\nSelect a field to edit:",
-            reply_markup=admin_edit_fields_keyboard(plan_id),
+            reply_markup=admin_edit_fields_keyboard(plan_id, plan.get("is_hidden", False)),
         )
     except Exception:
         pass

@@ -36,7 +36,7 @@ from database import (
     get_due_start_reminders,
     advance_start_reminder,
     cancel_start_reminders,
-    get_all_plans,
+    get_visible_plans,
     get_due_demo_sessions,
     claim_demo_expiry,
     complete_demo_deletion,
@@ -236,7 +236,7 @@ async def _tick(bot: Bot) -> None:
             await cancel_start_reminders(user_id)
             continue
 
-        plans = await get_all_plans()
+        plans = await get_visible_plans()
         if not plans:
             continue
 

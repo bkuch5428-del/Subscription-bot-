@@ -7,7 +7,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from config import SUPPORT_GROUP_URL
-from database import get_all_plans, get_user_active_subscription, get_setting, get_user_referral_info
+from database import get_visible_plans, get_user_active_subscription, get_setting, get_user_referral_info
 from keyboards.menu import plan_detail_keyboard, plans_list_keyboard, refer_share_keyboard
 
 _IST = timezone(timedelta(hours=5, minutes=30))
@@ -38,7 +38,7 @@ async def cmd_debug(message: Message) -> None:
 @router.message(Command("plans", ignore_case=True))
 async def cmd_plans(message: Message) -> None:
     logger.info("/plans from user %s", message.from_user.id)
-    plans = await get_all_plans()
+    plans = await get_visible_plans()
     if not plans:
         await message.answer("📦 No plans are available right now. Check back later.")
         return

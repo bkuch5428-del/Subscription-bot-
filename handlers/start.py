@@ -10,7 +10,7 @@ from aiogram.types import Message, CallbackQuery
 
 from database import (
     save_user, save_referral, get_user_referral_info,
-    get_all_plans, get_plan, get_setting, get_start_demo,
+    get_visible_plans, get_plan, get_setting, get_start_demo,
     schedule_referral_reminder,
     save_plan_interest,
     schedule_start_reminders,
@@ -276,7 +276,7 @@ async def cmd_start(message: Message, bot: Bot) -> None:
 
     step_started = time.perf_counter()
     plans, welcome_setting, has_approved, first_setting, max_setting = await asyncio.gather(
-        get_all_plans(),
+        get_visible_plans(),
         get_setting("welcome_message"),
         has_any_approved_order(user.id),
         get_setting("start_reminder_first_min", "15"),
@@ -324,7 +324,7 @@ async def cmd_start(message: Message, bot: Bot) -> None:
 @router.callback_query(lambda c: c.data == "show_plans")
 async def cb_show_plans(call: CallbackQuery, bot: Bot) -> None:
     await call.answer()
-    plans = await get_all_plans()
+    plans = await get_visible_plans()
     if not plans:
         await call.message.answer(NO_PLANS_TEXT)
         return
@@ -358,6 +358,9 @@ async def callback_plan(call: CallbackQuery, bot: Bot) -> None:
     _log_timing("plan_callback", "plan lookup", flow_started, step_started)
     if not plan:
         await call.message.answer("⚠️ Plan not found. It may have been removed.")
+        return
+    if plan.get("is_hidden", False) is True:
+        await call.message.answer("⚠️ This plan is currently unavailable.")
         return
 
     _schedule_background(
@@ -410,7 +413,7 @@ async def callback_plan(call: CallbackQuery, bot: Bot) -> None:
 @router.callback_query(lambda c: c.data == "back")
 async def callback_back(call: CallbackQuery) -> None:
     await call.answer()
-    plans = await get_all_plans()
+    plans = await get_visible_plans()
     if not plans:
         await call.message.answer(NO_PLANS_TEXT)
         return
@@ -425,7 +428,7 @@ async def callback_back(call: CallbackQuery) -> None:
 @router.callback_query(lambda c: c.data == "main_menu")
 async def callback_main_menu(call: CallbackQuery) -> None:
     await call.answer()
-    plans = await get_all_plans()
+    plans = await get_visible_plans()
     if not plans:
         await call.message.answer(NO_PLANS_TEXT)
         return

@@ -23,7 +23,7 @@ import os
 from datetime import datetime, timezone, timedelta
 
 from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo import UpdateOne
+from pymongo import ReturnDocument, UpdateOne
 from config import VC_GATEWAY_ENABLED
 
 logger = logging.getLogger(__name__)
@@ -661,6 +661,7 @@ def _plan_doc_to_dict(doc: dict) -> dict:
         "buy_message":        doc.get("buy_message", ""),
         "qr_image":           doc.get("qr_image", ""),
         "sort_order":         doc.get("sort_order", 0),
+        "is_hidden":          doc.get("is_hidden") is True,
         "created_at":         doc.get("created_at"),
     }
 
@@ -702,6 +703,7 @@ async def create_plan(
         "source_channel_id": source_channel_id,
         "access_link":       access_link,
         "sort_order":        sort_order,
+        "is_hidden":         False,
         "created_at":        datetime.now(timezone.utc),
     })
     logger.info("Created plan id=%s name=%r", plan_id, name)
@@ -711,6 +713,12 @@ async def create_plan(
 async def get_all_plans() -> list[dict]:
     """Return all plans as a list of dicts, ordered by their display order."""
     cursor = _plans.find({}).sort([("sort_order", 1), ("_id", 1)])
+    return [_plan_doc_to_dict(doc) async for doc in cursor]
+
+
+async def get_visible_plans() -> list[dict]:
+    """Return plans available for new user purchases, including legacy plans."""
+    cursor = _plans.find({"is_hidden": {"$ne": True}}).sort([("sort_order", 1), ("_id", 1)])
     return [_plan_doc_to_dict(doc) async for doc in cursor]
 
 
@@ -727,6 +735,16 @@ async def update_plan(plan_id: int, **fields) -> None:
     if fields:
         await _plans.update_one({"_id": plan_id}, {"$set": fields})
     logger.info("Updated plan id=%s fields=%s", plan_id, list(fields.keys()))
+
+
+async def toggle_plan_visibility(plan_id: int) -> dict | None:
+    """Atomically toggle one plan's visibility; missing legacy flags start visible."""
+    doc = await _plans.find_one_and_update(
+        {"_id": plan_id},
+        [{"$set": {"is_hidden": {"$not": [{"$ifNull": ["$is_hidden", False]}]}}}],
+        return_document=ReturnDocument.AFTER,
+    )
+    return _plan_doc_to_dict(doc) if doc else None
 
 
 # ── Plan ordering ─────────────────────────────────────────────────────────────

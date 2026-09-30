@@ -154,13 +154,17 @@ def admin_user_details_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def admin_edit_fields_keyboard(plan_id: int) -> InlineKeyboardMarkup:
+def admin_edit_fields_keyboard(plan_id: int, is_hidden: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📝 Name",         callback_data=f"admin_ef:{plan_id}:name")],
             [InlineKeyboardButton(text="💰 Price",        callback_data=f"admin_ef:{plan_id}:price")],
             [InlineKeyboardButton(text="⏳ Validity",     callback_data=f"admin_ef:{plan_id}:validity")],
             [InlineKeyboardButton(text="🔗 Access Link",  callback_data=f"admin_ef:{plan_id}:access_link")],
+            [InlineKeyboardButton(
+                text="👁️ Show Plan" if is_hidden else "👁️ Hide Plan",
+                callback_data=f"admin_toggle_plan_visibility:{plan_id}",
+            )],
             [
                 InlineKeyboardButton(text="⬆ Move Up",   callback_data=f"admin_mv:up:{plan_id}"),
                 InlineKeyboardButton(text="⬇ Move Down", callback_data=f"admin_mv:down:{plan_id}"),
